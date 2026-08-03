@@ -14,11 +14,11 @@ GEOJSON_PATH = os.path.join(DATA_DIR, "Asean.geojson")
 OPENCELLID_PATH = os.path.join(DATA_DIR, "cell_towers.csv.gz")
 OUTPUT_FILE_PATH = os.path.join(DATA_DIR, "jendela_phase2_esg_matrix.parquet")
 
+GEE_DRIVE_FOLDER = 'ESG_Hackathon'
 
 # Tuple of all ASEAN Mobile Country Codes
 ASEAN_MCCS = (414, 452, 456, 457, 502, 510, 515, 520, 525, 528)
 
-TARGET_REGION = "Malaysia"
 ASEAN_BOUNDS = {
     "Malaysia": [99.6, 0.8, 119.3, 7.5],
     "Indonesia": [95.0, -11.0, 141.0, 6.0],
@@ -29,11 +29,11 @@ ASEAN_BOUNDS = {
     "Cambodia": [102.3, 10.4, 107.6, 14.7],
     "Myanmar": [92.2, 9.6, 101.2, 28.5],
     "Laos": [100.1, 13.9, 107.7, 22.5],
-    "Brunei": [114.2, 4.0, 115.4, 4.6]
+    "Brunei": [114.2, 4.0, 115.4, 4.6] 
 }
 
 OOKLA_DATA_URL = 'https://ookla-open-data.s3.us-west-2.amazonaws.com/parquet/performance/type=mobile/year=2023/quarter=4/2023-10-01_performance_mobile_tiles.parquet'
 
 BUFFER_RADIUS_M = 2750  # ~5.5km diameter
 GEE_SCALE_M = 500       # middle point between accuracy and extraction speed
-CHUNK_SIZE = 50        # For GEE batch extraction
+CHUNK_SIZE = 8000        # For GEE batch extraction (Keeps the HTTP payload well under the 10MB limit)

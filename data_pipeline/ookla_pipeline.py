@@ -1,32 +1,70 @@
 import duckdb
-import numpy as np
 import geopandas as gpd
 import pandas as pd
-from config import ASEAN_BOUNDS, OOKLA_DATA_URL, GEOJSON_PATH
+from data_pipeline.config import ASEAN_BOUNDS, OOKLA_DATA_URL, GEOJSON_PATH
 
 def get_underserved_sites(region_name):
-    print(f"🛠️ INJECTING MOCK OOKLA DATA FOR FAST TESTING...")
-    
-    # Generate 200 perfectly formatted fake tiles around Central Malaysia
-    np.random.seed(42)
-    mock_df = pd.DataFrame({
-        # Change this line to generate purely numeric string IDs
-        'site_id': [str(10000 + i) for i in range(200)], 
-        'longitude': np.random.uniform(100.0, 104.0, 200),
-        'latitude': np.random.uniform(2.0, 5.0, 200),
-        'download_kbps': np.random.uniform(500, 60000, 200),
-        'tests': np.random.randint(1, 50, 200),
-        'devices': np.random.randint(1, 15, 200)
-    })
-    
-    # Convert standard DataFrame to a GeoDataFrame so DuckDB has a 'geometry' column
-    mock_gdf = gpd.GeoDataFrame(
-        mock_df, 
-        geometry=gpd.points_from_xy(mock_df['longitude'], mock_df['latitude']),
+    bounds = ASEAN_BOUNDS.get(region_name)
+    if not bounds:
+        raise ValueError(f"Region {region_name} not found in config.")
+       
+    min_lon, min_lat, max_lon, max_lat = bounds
+    print(f"🌍 Querying Ookla data from Ookla Parquet for {region_name}...")
+   
+    query = f"""
+        SELECT
+            quadkey AS site_id,
+            tile_x AS longitude,
+            tile_y AS latitude,
+            avg_d_kbps AS download_kbps,
+            tests,
+            devices
+        FROM read_parquet('{OOKLA_DATA_URL}')
+        WHERE tile_x >= {min_lon} AND tile_x <= {max_lon}
+          AND tile_y >= {min_lat} AND tile_y <= {max_lat}
+    """
+   
+    raw_df = duckdb.query(query).df()
+   
+    if len(raw_df) == 0:
+        print("⚠️ No data found for this bounding box.")
+        return raw_df
+   
+    print(f"🗺️ Performing spatial clip using {region_name} boundaries...")
+
+
+    # 1. Convert Pandas DataFrame into a spatially-aware GeoDataFrame
+    gdf_sites = gpd.GeoDataFrame(
+        raw_df,
+        geometry=gpd.points_from_xy(raw_df.longitude, raw_df.latitude),
         crs="EPSG:4326"
     )
+
+
+    # 2. Load custom GeoJSON and isolate the target country's shape dynamically
+    asean_gdf = gpd.read_file(GEOJSON_PATH)
     
-    return mock_gdf
+    # Enforce uniform CRS before the spatial join
+    if asean_gdf.crs and asean_gdf.crs != "EPSG:4326":
+        print(f"🔄 Aligning Shape CRS from {asean_gdf.crs} to EPSG:4326")
+        asean_gdf = asean_gdf.to_crs("EPSG:4326")
+        
+    target_shape = asean_gdf[asean_gdf['Country'] == region_name]
+
+    # 3. Perform spatial join OR bypass if it's a sub-region test
+    if target_shape.empty:
+        print(f"⚠️ '{region_name}' is a sub-region. Bypassing national shape clip and using strict bounding box.")
+        df_clean = gdf_sites # filtered geographically
+    else:
+        clipped_gdf = gpd.sjoin(gdf_sites, target_shape, predicate='within')
+        df_clean = clipped_gdf.drop(
+            columns=['index_right', 'OBJECTID', 'Country', 'Flag'],
+            errors='ignore'
+        )
+
+    print(f"✅ Spatial filter complete! New site count: {len(df_clean)}")
+    
+    return df_clean
 
 # ==========================================
 #  STRATIFIED OOKLA TILE SCREENING

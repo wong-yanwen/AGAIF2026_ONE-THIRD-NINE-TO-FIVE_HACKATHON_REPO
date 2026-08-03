@@ -1,8 +1,9 @@
-import ee
 import pandas as pd
 import geopandas as gpd
 import time
-from config import BUFFER_RADIUS_M, GEE_SCALE_M, CHUNK_SIZE
+import os
+import ee
+from data_pipeline.config import BUFFER_RADIUS_M, GEE_SCALE_M, GEE_DRIVE_FOLDER, CHUNK_SIZE
 
 def init_gee():
     try:
@@ -26,60 +27,116 @@ def build_esg_composite():
     
     return ee.Image.cat([viirs, era5, worldpop, elevation, slope, rainfall])
 
-def extract_gee_data(df_sites):
+def extract_gee_data(df_sites, country_name):
     init_gee()
     composite = build_esg_composite()
     
-    all_records = []
-    total_sites = len(df_sites)
+    print(f"📦 Packaging {len(df_sites)} site geometries for server-side processing...")
     
-    print(f"⏳ Extracting GEE data in chunks of {CHUNK_SIZE}...")
+    # 1. Chunk the dataframe to bypass the 10MB payload limit 
+    tasks = []
+    task_names = []
     
-    for i in range(0, total_sites, CHUNK_SIZE):
-        chunk = df_sites.iloc[i:i + CHUNK_SIZE]
+    # Generate a single timestamp so all chunks group nicely in Google Drive
+    run_timestamp = int(time.time())
+    
+    for i in range(0, len(df_sites), CHUNK_SIZE):
+        chunk_df = df_sites.iloc[i:i+CHUNK_SIZE]
+        part_num = (i // CHUNK_SIZE) + 1
         
-        # Casting to prevent JSON serialization anomalies from Pandas/NumPy types.
         features = [
             ee.Feature(
                 ee.Geometry.Point(float(row['longitude']), float(row['latitude'])), 
                 {'site_id': int(row['site_id'])}
             )
-            for _, row in chunk.iterrows()
+            for _, row in chunk_df.iterrows()
         ]
         
         fc = ee.FeatureCollection(features).map(lambda f: f.buffer(BUFFER_RADIUS_M))
-
-        # to be removed 
-        # SAFEGUARD: Filter out any geometries that fall completely outside 
-        # the composite raster boundaries to prevent out-of-bounds computation errors.
-        #runnable_fc = fc.filterBounds(composite.geometry()) 
-
         combined_reducer = ee.Reducer.mean().combine(reducer2=ee.Reducer.sum(), sharedInputs=True)
         
-        # Added crs='EPSG:4326' to mirror the working legacy function
-        reduced = composite.reduceRegions(
+        reduced_fc = composite.reduceRegions(
             collection=fc,
             reducer=combined_reducer,
-            scale=GEE_SCALE_M,  # 500m 
-            crs='EPSG:4326',
+            scale=GEE_SCALE_M,
             tileScale=4
         )
         
-        # Wrapped .getInfo() in a try-except block for safe error handling
-        try:
-            data = reduced.getInfo()
-            for feature in data.get('features', []):
-                props = feature.get('properties', {})
-                all_records.append(props)
-        except Exception as e:
-            print(f"❌ GEE Server-Side Error Caught on chunk starting at index {i}: {e}")
-            raise e
-            
-        print(f"    Processed {min(i + CHUNK_SIZE, total_sites)} / {total_sites} sites...")
-        time.sleep(1) # resting time
+        # Add 'pt1', 'pt2', etc., to avoid filename collisions
+        task_name = f"GEE_Extract_{country_name}_{run_timestamp}_pt{part_num}"
+        task = ee.batch.Export.table.toDrive(
+            collection=reduced_fc,
+            description=task_name,
+            folder=GEE_DRIVE_FOLDER,
+            fileFormat='CSV'
+        )
         
-    df_env = pd.DataFrame(all_records)
-    return df_env
+        print(f"🚀 Dispatching chunk {part_num} to GEE servers ({len(chunk_df)} sites)...")
+        task.start()
+        tasks.append(task)
+        task_names.append(task_name)
+        
+    # 2. Automated Polling Loop for ALL chunks
+    print(f"⏳ Waiting for {len(tasks)} batch tasks to complete on Google servers. This will take a while...")
+    
+    completed_tasks = set()
+    while len(completed_tasks) < len(tasks):
+        for idx, task in enumerate(tasks):
+            if idx in completed_tasks:
+                continue
+                
+            state = task.status().get('state', 'UNKNOWN')
+            if state in ['COMPLETED', 'FAILED', 'CANCELLED']:
+                completed_tasks.add(idx)
+                if state != 'COMPLETED':
+                    error_msg = task.status().get('error_message', 'Unknown error')
+                    raise RuntimeError(f"❌ GEE Task {task_names[idx]} Failed: {error_msg}")
+                else:
+                    print(f"✅ Task {task_names[idx]} Finished on Server! ({len(completed_tasks)}/{len(tasks)})")
+                    
+        if len(completed_tasks) < len(tasks):
+            print(f"⏳ {len(completed_tasks)}/{len(tasks)} tasks finished. Sleeping for 2 minutes...")
+            time.sleep(120) 
+            
+    # Extra time to sync gdrive
+    print("📥 Waiting 15 seconds for Google Drive to sync local files...")
+    time.sleep(15)
+    
+    # 3. Robust Fallback & Merge Loop
+    all_dfs = []
+    for task_name in task_names:
+        expected_path = f"G:/My Drive/{GEE_DRIVE_FOLDER}/{task_name}.csv"
+        
+        if not os.path.exists(expected_path):
+            print(f"\n⚠️ Auto-sync warning: Could not detect file for chunk: {expected_path}")
+            while True:
+                user_input = input(f"📥 Paste the local path to {task_name}.csv (or press Enter to retry auto-detect): ").strip()
+                
+                if not user_input:
+                    if os.path.exists(expected_path):
+                        resolved_path = expected_path
+                        break
+                    else:
+                        print(f"❌ Still not found at default path. Please download {task_name}.csv manually.")
+                        continue
+                        
+                user_input = user_input.replace('"', '').replace("'", "")
+                if os.path.exists(user_input):
+                    resolved_path = user_input
+                    break
+                else:
+                    print(f"❌ File not found at provided path. Please try again.")
+        else:
+            resolved_path = expected_path
+
+        print(f"📖 Loading environment metrics from chunk: {resolved_path}")
+        df_chunk = pd.read_csv(resolved_path)
+        all_dfs.append(df_chunk)
+        
+    # Combine all chunks into one massive dataframe to pass downstream
+    df_env_full = pd.concat(all_dfs, ignore_index=True)
+    return df_env_full
+
 
 def clean_and_merge(df_ookla, df_env):
     # Check if df_env is empty to prevent errors if a chunk failed silently

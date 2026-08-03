@@ -1,11 +1,10 @@
-import time
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import requests
-from shapely.geometry import Point, LineString
+import duckdb
 from sklearn.cluster import DBSCAN
-from config import ASEAN_BOUNDS
+from data_pipeline.config import ASEAN_BOUNDS
 
 def get_utm_crs(longitude):
     """
@@ -55,133 +54,105 @@ def process_candidate_site_clusters(df_raw, eps_meters=500, min_samples=1):
     # Revert back to standard GPS coordinates for downstream GEE merging
     return clustered_sites.to_crs("EPSG:4326")
 
-def fetch_osm_layer_chunked(gdf_sites, region_name, osm_query_type, step_size_deg=2.0):
+
+def fetch_overture_layer(gdf_sites, region_name, layer_name):
     """
-    Queries the Overpass API using a sliding spatial grid window that filters out 
-    empty ocean cells based on tower presence, drastically reducing API load.
+    Streams infrastructure data directly from Overture Maps' AWS S3 buckets 
+    using DuckDB, dynamically fetching the latest release to prevent broken paths.
     """
     bounds = ASEAN_BOUNDS.get(region_name)
     if not bounds:
-        raise ValueError(f"Region {region_name} not found in configuration bounds mapping.")
+        raise ValueError(f"Region {region_name} not found in bounds mapping.")
         
     min_lon, min_lat, max_lon, max_lat = bounds
     
-    overpass_urls = [
-        "https://overpass-api.de/api/interpreter",
-        "https://lz4.overpass-api.de/api/interpreter",
-        "https://z.overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter"
-    ]
-    url_idx = 0
+    # 1. Dynamically fetch the latest active release version to prevent IO Errors
+    print("📡 Fetching latest Overture Maps release version from STAC catalog...")
+    try:
+        catalog = requests.get('https://stac.overturemaps.org/catalog.json').json()
+        release_version = catalog.get('latest')
+    except Exception:
+        # Fallback to the current stable release as of August 2026
+        release_version = '2026-07-22.0'
+        
+    release_path = f"s3://overturemaps-us-west-2/release/{release_version}"
+    print(f"☁️ Querying Overture Maps (AWS S3) at {release_version} for {layer_name} in {region_name}...")
     
-    lon_grid = np.arange(min_lon, max_lon + step_size_deg, step_size_deg)
-    lat_grid = np.arange(min_lat, max_lat + step_size_deg, step_size_deg)
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("SET s3_region='us-west-2';")
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ESG-Research-Jendela-v2',
-        'Accept': 'application/json'
-    }
-    
-    features = []
-    
-    # Pre-calculate which windows actually contain towers to save API requests
-    valid_windows = []
-    for i in range(len(lon_grid) - 1):
-        for j in range(len(lat_grid) - 1):
-            w_min_lon, w_max_lon = lon_grid[i], lon_grid[i+1]
-            w_min_lat, w_max_lat = lat_grid[j], lat_grid[j+1]
-            
-            # Check if any towers fall inside this specific window using spatial indexing
-            towers_in_cell = gdf_sites.cx[w_min_lon:w_max_lon, w_min_lat:w_max_lat]
-            
-            if not towers_in_cell.empty:
-                valid_windows.append((w_min_lat, w_min_lon, w_max_lat, w_max_lon))
+    # 2. Extract geometry AS WKB (Well-Known Binary) for GeoPandas compatibility
+    if layer_name == "power":
+        query = f"""
+            SELECT ST_AsWKB(geometry) as geom_wkb, class as osm_type 
+            FROM read_parquet('{release_path}/theme=base/type=infrastructure/*', filename=true, hive_partitioning=1)
+            WHERE bbox.xmax >= {min_lon} AND bbox.xmin <= {max_lon}
+            AND bbox.ymax >= {min_lat} AND bbox.ymin <= {max_lat}
+            AND class = 'power_line'
+        """
+    elif layer_name == "roads":
+        query = f"""
+            SELECT ST_AsWKB(geometry) as geom_wkb, class as osm_type 
+            FROM read_parquet('{release_path}/theme=transportation/type=segment/*', filename=true, hive_partitioning=1)
+            WHERE bbox.xmax >= {min_lon} AND bbox.xmin <= {max_lon}
+            AND bbox.ymax >= {min_lat} AND bbox.ymin <= {max_lat}
+            AND class IN ('primary', 'secondary', 'tertiary', 'trunk')
+        """
+    elif layer_name == "amenities":
+        query = f"""
+            SELECT ST_AsWKB(geometry) as geom_wkb, categories.primary as osm_type 
+            FROM read_parquet('{release_path}/theme=places/type=place/*', filename=true, hive_partitioning=1)
+            WHERE bbox.xmax >= {min_lon} AND bbox.xmin <= {max_lon}
+            AND bbox.ymax >= {min_lat} AND bbox.ymin <= {max_lat}
+            AND categories.primary IN ('school', 'hospital', 'clinic')
+        """
+    else:
+        raise ValueError("Invalid layer name requested.")
 
-    total_cells = len(valid_windows)
-    print(f"🗺️ Orchestrating optimized grid splitting for {region_name} ({osm_query_type}).")
-    print(f"🌊 Filtered out ocean cells. Querying only {total_cells} active land windows containing infrastructure...")
-
-    for idx, (w_min_lat, w_min_lon, w_max_lat, w_max_lon) in enumerate(valid_windows):
-        bbox_str = f"{w_min_lat},{w_min_lon},{w_max_lat},{w_max_lon}"
-        settings = f"[out:json][timeout:90][bbox:{bbox_str}];"
-        
-        queries = {
-            "power": f"{settings}(way['power'='line'];node['power'='substation'];way['power'='substation'];);out geom;",
-            "roads": f"{settings}(way['highway'~'^(primary|secondary|tertiary|trunk)$'];);out geom;",
-            "amenities": f"{settings}(node['amenity'~'^(school|clinic|hospital)$'];way['amenity'~'^(school|clinic|hospital)$'];);out geom;"
-        }
-        
-        retries = 4
-        backoff_time = 10  # Reduced initial penalty to 10 seconds
-        
-        while retries > 0:
-            current_url = overpass_urls[url_idx % len(overpass_urls)]
-            try:
-                response = requests.post(
-                    current_url, 
-                    data={'data': queries[osm_query_type]}, 
-                    headers=headers, 
-                    timeout=110
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    for element in data.get('elements', []):
-                        if element['type'] == 'node':
-                            geom = Point(element['lon'], element['lat'])
-                        elif 'geometry' in element:
-                            geom = LineString([(pt['lon'], pt['lat']) for pt in element['geometry']])
-                        else:
-                            continue
-                            
-                        features.append({
-                            'geometry': geom,
-                            'osm_type': element.get('tags', {}).get('amenity') or 
-                                        element.get('tags', {}).get('power') or 
-                                        element.get('tags', {}).get('highway')
-                        })
-                    break 
-                    
-                elif response.status_code == 429:
-                    print(f"   ⚠️ HTTP 429 on {current_url.split('//')[1].split('/')[0]}. Waiting {backoff_time}s...")
-                    time.sleep(backoff_time)
-                    backoff_time = min(backoff_time * 2, 30) # 💥 Capped backoff at 30 seconds max
-                    url_idx += 1 
-                    retries -= 1
-                else:
-                    break
-                    
-            except requests.exceptions.Timeout:
-                url_idx += 1
-                retries -= 1
-        
-        # Polite baseline breather
-        time.sleep(2.0)
-
-    if len(features) == 0:
+    # Execute and convert directly to a Pandas DataFrame
+    df = con.execute(query).df()
+    
+    if df.empty:
+        print(f"⚠️ No {layer_name} found in this bounding box.")
         return gpd.GeoDataFrame(columns=['geometry', 'osm_type'], crs="EPSG:4326")
 
-    return gpd.GeoDataFrame(features, crs="EPSG:4326")
+    # Cast DuckDB's bytearray type to standard Python bytes for Shapely compatibility
+    df['geom_wkb'] = df['geom_wkb'].apply(bytes)
 
+    # 3. Convert the WKB binary back into shapely geometry objects
+    gdf = gpd.GeoDataFrame(
+        df, 
+        geometry=gpd.GeoSeries.from_wkb(df['geom_wkb']), 
+        crs="EPSG:4326"
+    )
+    
+    # Clean up the temporary binary column
+    gdf = gdf.drop(columns=['geom_wkb'])
+    
+    return gdf
 
 def engineering_osm_proximity_features(gdf_sites, region_name):
     """
     Calculates proximity distances against the chunk-harvested infrastructure nodes.
     """
     print(f"🌐 Running vectorized distance calculations for {region_name}...")
-    
+   
     avg_lon = gdf_sites['geometry'].x.mean()
     dynamic_epsg = get_utm_crs(avg_lon)
     sites_metric = gdf_sites.to_crs(dynamic_epsg)
-    
+   
     for layer_name in ["power", "roads", "amenities"]:
         print(f"📥 Extracting chunked vectors for layer: {layer_name}")
-        
-        # 💥 PASS gdf_sites into the updated chunked fetcher
-        raw_osm = fetch_osm_layer_chunked(gdf_sites, region_name, layer_name)
-        
+       
+        raw_osm = fetch_overture_layer(gdf_sites, region_name, layer_name)
+
+        # Explicitly map the layer names to the expected downstream column names
+        name_map = {"power": "power", "roads": "road", "amenities": "amenity"}
+        target_col = f"distance_to_{name_map[layer_name]}_m"
+
         if raw_osm.empty:
-            target_col = f"distance_to_{layer_name[:-1] if layer_name=='amenities' else layer_name}_m"
             gdf_sites[target_col] = np.nan
             continue
             
@@ -189,7 +160,6 @@ def engineering_osm_proximity_features(gdf_sites, region_name):
         joined = gpd.sjoin_nearest(sites_metric, osm_metric, distance_col="distance_metrics", how="left")
         joined = joined[~joined.index.duplicated(keep='first')]
         
-        target_column_label = f"distance_to_{layer_name[:-1] if layer_name=='amenities' else layer_name}_m"
-        gdf_sites[target_column_label] = joined["distance_metrics"]
-        
+        gdf_sites[target_col] = joined["distance_metrics"]
+       
     return gdf_sites

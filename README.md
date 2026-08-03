@@ -32,8 +32,9 @@ pip install --upgrade pip
 Our stack relies heavily on compiled C-libraries for fast spatial queries. Install the pinned dependencies:
 
 ```bash
-pip install pandas geopandas duckdb shapely earthengine-api lightgbm shap scikit-learn pyarrow  mapclassify
+pip install pandas geopandas duckdb shapely earthengine-api lightgbm shap scikit-learn pyarrow mapclassify folium streamlit
 ```
+
 Note: pyarrow is strictly required to read and write the pipeline's high-performance .parquet feature matrices.
 
 ### 4. Google Earth Engine Authentication
@@ -43,10 +44,19 @@ earthengine authenticate
 ```
 Follow the browser prompts to log in with your authorized Google Account.
 
-### 5. Required Local Raw Data Files
-Ensure the following baseline files are placed inside the `data/` directory (these are excluded from version control due to file size):
-<br>[link to gdrive](https://drive.google.com/drive/folders/10lmJf6Ac1BC10_Ry8uGMd_v30uAPdZY_?usp=sharing)
+### 5. Required Local Data Files (Data Engineering vs. UI Workflow)
+Depending on your role in the team, you need different files in your local `data/` directory (these are excluded from version control due to file size). 
+<br>[link to team gdrive](https://drive.google.com/drive/folders/10lmJf6Ac1BC10_Ry8uGMd_v30uAPdZY_?usp=sharing)
 
-* data/Asean.geojson 
-* data/cell_towers.csv.gz
+**For Data Engineers (Running the full ETL Pipeline):**
+Download the raw baseline files into `/data`:
+* `Asean.geojson` 
+* `cell_towers.csv.gz`
+
+**For UI/UX & Algorithm Leads (Building Streamlit/Dashboards):**
+You do NOT need to run `main.py`. Simply download the pre-computed national feature matrices into `/data`:
+* `jendela_phase2_esg_matrix_malaysia.parquet`
+* `jendela_phase2_esg_matrix_indonesia.parquet`
+* *(etc...)*
   
+### NOTE: If a notebook is ran, please make sure to clear all cell outputs before pushing to Github.

@@ -227,6 +227,10 @@ data/
 # Keep the data folder structure in Git without tracking its contents
 !data/.gitkeep
 
+# Ignore generated matrix files and maps if accidentally saved outside the data directory
+*.parquet
+jendela_phase2_esg_matrix_*.html
+
 # DuckDB storage and write-ahead logs
 *.duckdb
 *.duckdb.wal

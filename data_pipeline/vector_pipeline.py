@@ -4,8 +4,6 @@ import numpy as np
 import os
 import tempfile
 import uuid
-from config import ASEAN_MCCS, OPENCELLID_PATH 
-
 
 def get_utm_crs(longitude):
     """Calculates the UTM EPSG code based on longitude."""
