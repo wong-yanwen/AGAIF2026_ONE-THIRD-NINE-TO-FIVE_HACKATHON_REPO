@@ -132,9 +132,9 @@ def calculate_esg_priority_matrix(df):
   # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr, 65% abatement)
   df['indicative_abatement_tco2e_yr'] = 34.2 * 0.65
 
-  # Underperformance Residual
+# Underperformance Residual - USE CROSS-VALIDATION
   df['underperformance_residual'] = (
-      df['predicted_download_kbps'] - df['download_kbps']
+      df['cv_predicted_speed'] - df['download_kbps']
   )
   df['underperformance_residual'] = df['underperformance_residual'].apply(
       lambda x: max(x, 1.0)

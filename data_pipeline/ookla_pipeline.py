@@ -70,37 +70,41 @@ def get_underserved_sites(region_name):
 #  STRATIFIED OOKLA TILE SCREENING
 # ==========================================
 def apply_stratified_ookla_screening(gdf_ookla):
-    """
-    Applies within-stratum 20th percentile filters using population density tiers.
-    after GEE extraction layers have been fused in main.py.
-    """
     print("📉 Stratifying performance thresholds by regional population profile...")
     
-    # Enforce strict data validity guardrails
-    valid_tiles = gdf_ookla[(gdf_ookla['tests'] >= 15) & (gdf_ookla['devices'] >= 5)].copy()
+    # 1. Identify valid tiles for the threshold math, but do not drop the rest!
+    valid_mask = (gdf_ookla['tests'] >= 15) & (gdf_ookla['devices'] >= 5)
+    valid_tiles = gdf_ookla[valid_mask].copy()
 
     if len(valid_tiles) == 0:
-        print("⚠️ No tiles met the baseline evidence threshold criteria (>=15 tests, >=5 devices).")
-        return valid_tiles
+        print("⚠️ No tiles met the baseline evidence threshold.")
+        return gdf_ookla
 
-    
-    # Establish population boundaries across the datasets using GEE output
+    # 2. Establish population boundaries
     cutoffs = valid_tiles['population_total'].quantile([0.33, 0.66]).values
     
     def assign_tier(val):
         if val <= cutoffs[0]: return 'rural'
         if val <= cutoffs[1]: return 'peri-urban'
         return 'urban'
-        
+   
+    # Apply the tier assignment to BOTH dataframes
+    gdf_ookla['demographic_stratum'] = gdf_ookla['population_total'].apply(assign_tier)
     valid_tiles['demographic_stratum'] = valid_tiles['population_total'].apply(assign_tier)
-    
-    # Screen tiles falling under their respective stratum's Q1 line
+
+    # 3. Calculate Q1 thresholds ONLY from valid tiles
     q1_thresholds = valid_tiles.groupby('demographic_stratum')['download_kbps'].quantile(0.20).to_dict()
     
-    underserved_mask = valid_tiles.apply(
-        lambda r: r['download_kbps'] < q1_thresholds[r['demographic_stratum']], axis=1
+    # 4. Flag the target tiles instead of dropping the dataset
+    gdf_ookla['is_underserved_target'] = gdf_ookla.apply(
+        lambda r: True if (
+            r['tests'] >= 15 and 
+            r['devices'] >= 5 and 
+            r['download_kbps'] < q1_thresholds.get(r['demographic_stratum'], 0)
+        ) else False, axis=1
     )
-    filtered_results = valid_tiles[underserved_mask].copy()
-    print(f"🎯 Target Acquired: {len(filtered_results):,} verified underserved target tiles.")
     
-    return filtered_results
+    print(f"🎯 Target Acquired: {gdf_ookla['is_underserved_target'].sum():,} verified underserved target tiles flagged.")
+    
+    # Return the entire dataset so the confidence mask can see Tier 2 and Tier 3
+    return gdf_ookla
