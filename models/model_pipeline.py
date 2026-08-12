@@ -17,17 +17,18 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   """
   print("🎯 Initializing Spatially Blocked Cross-Validation...")
 
+  # Generate 0.5-degree spatial blocks first, on the full dataframe,
+  # so these columns survive into the exported output.
+  df['lat_block'] = (df['latitude'] / 0.5).astype(int)
+  df['lon_block'] = (df['longitude'] / 0.5).astype(int)
+  df['spatial_block'] = (
+      df['lat_block'].astype(str) + "_" + df['lon_block'].astype(str)
+  )
+
   # Only fit/validate on tiles with reliable Ookla labels (evidence threshold).
   evidence_mask = (df['tests'] >= 15) & (df['devices'] >= 5) & (df['is_underserved_target'] == True)
   train_pool = df[evidence_mask].copy()
   print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
-
-  # Generate 0.5-degree spatial blocks (on the reliable subset only)
-  train_pool['lat_block'] = (train_pool['latitude'] / 0.5).astype(int)
-  train_pool['lon_block'] = (train_pool['longitude'] / 0.5).astype(int)
-  train_pool['spatial_block'] = (
-      train_pool['lat_block'].astype(str) + "_" + train_pool['lon_block'].astype(str)
-  )
 
   unique_blocks = np.array(sorted(train_pool['spatial_block'].unique()))
   num_blocks = len(unique_blocks)
@@ -96,6 +97,12 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   final_model.fit(train_pool[features], train_pool[target])
   df['predicted_download_kbps'] = final_model.predict(df[features])
 
+  # Rows outside the training pool never get a CV-validated prediction;
+  # fall back to the production model's prediction so residuals/scoring
+  # don't silently propagate NaN into the shortlist.
+  missing_cv = df['cv_predicted_speed'].isna()
+  df.loc[missing_cv, 'cv_predicted_speed'] = df.loc[missing_cv, 'predicted_download_kbps']
+
   # ---- SHAP explainability ----
   print("🔍 Computing SHAP feature contributions...")
   explainer = shap.TreeExplainer(final_model)
@@ -104,10 +111,6 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   top_feature_idx = np.abs(shap_values).argmax(axis=1)
   df['top_shap_driver'] = [features[i] for i in top_feature_idx]
   df['top_shap_value'] = shap_values[np.arange(len(df)), top_feature_idx]
-
-  # Fallback mapping if CV was bypassed
-  if df['cv_predicted_speed'].isna().all():
-    df['cv_predicted_speed'] = df['predicted_download_kbps']
 
   return df
 
@@ -149,7 +152,6 @@ def calculate_esg_priority_matrix(df):
       + (df['distance_to_road_m'] / 1000.0) * 0.3
   ).clip(lower=0.1)
 
- 
   # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr baseline).
   # Scale the abatement credit by off-grid likelihood so sites more likely
   # to actually be diesel-dependent get closer to the full GSMA-cited
@@ -215,6 +217,7 @@ def apply_governance_confidence_mask(df):
 
   df['confidence_tier'] = df.apply(assign_mask, axis=1)
   return df
+
 
 def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   # 1. Resolve input file: explicit path > region-based default > error
@@ -307,5 +310,3 @@ if __name__ == "__main__":
   import sys
   region_arg = sys.argv[1] if len(sys.argv) > 1 else "malaysia"
   run_pipeline(region=region_arg)
-
-
