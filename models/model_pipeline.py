@@ -1,11 +1,4 @@
-"""
-models/model_pipeline.py
-------------------------
-JENDELA Phase 2 - GeoAI Intelligence & ML Model Pipeline
-Role: Algorithm Engineer (Dhanya)
-"""
-
-import glob
+import shap
 import os
 import numpy as np
 import pandas as pd
@@ -17,18 +10,26 @@ from sklearn.model_selection import KFold
 def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   """Executes Spatially Blocked Cross-Validation to eliminate spatial autocorrelation data leakage.
 
-  Dynamically adapts to the geographic size of the input region.
+  Trains and validates only on tiles meeting the Ookla evidence threshold —
+  Thin/No-Data tiles have too few tests to serve as reliable training labels.
+  Every row in df still receives a prediction; only the fitting/scoring pool
+  is restricted.
   """
   print("🎯 Initializing Spatially Blocked Cross-Validation...")
 
-  # Generate 0.5-degree spatial blocks
-  df['lat_block'] = (df['latitude'] / 0.5).astype(int)
-  df['lon_block'] = (df['longitude'] / 0.5).astype(int)
-  df['spatial_block'] = (
-      df['lat_block'].astype(str) + "_" + df['lon_block'].astype(str)
+  # Only fit/validate on tiles with reliable Ookla labels (evidence threshold).
+  evidence_mask = (df['tests'] >= 15) & (df['devices'] >= 5) & (df['is_underserved_target'] == True)
+  train_pool = df[evidence_mask].copy()
+  print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
+
+  # Generate 0.5-degree spatial blocks (on the reliable subset only)
+  train_pool['lat_block'] = (train_pool['latitude'] / 0.5).astype(int)
+  train_pool['lon_block'] = (train_pool['longitude'] / 0.5).astype(int)
+  train_pool['spatial_block'] = (
+      train_pool['lat_block'].astype(str) + "_" + train_pool['lon_block'].astype(str)
   )
 
-  unique_blocks = df['spatial_block'].unique()
+  unique_blocks = np.array(sorted(train_pool['spatial_block'].unique()))
   num_blocks = len(unique_blocks)
 
   df['cv_predicted_speed'] = np.nan
@@ -40,7 +41,6 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
         " Bypassing CV step."
     )
   else:
-    # Dynamically reduce n_splits if region has fewer than 5 blocks
     actual_splits = min(n_splits, num_blocks)
     print(
         f"🧩 Found {num_blocks} unique spatial blocks. Running"
@@ -53,8 +53,8 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
       train_blocks = unique_blocks[train_idx]
       val_blocks = unique_blocks[val_idx]
 
-      train_data = df[df['spatial_block'].isin(train_blocks)]
-      val_data = df[df['spatial_block'].isin(val_blocks)]
+      train_data = train_pool[train_pool['spatial_block'].isin(train_blocks)]
+      val_data = train_pool[train_pool['spatial_block'].isin(val_blocks)]
 
       if train_data.empty or val_data.empty:
         continue
@@ -77,13 +77,33 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
           f" {global_r2:.3f}"
       )
 
-  # Train ultimate model on all data to extract production residuals
-  print("🧠 Training final production model on full dataset...")
+      # Stratified R² — show whether the model generalizes evenly,
+      # or whether the pooled number is hiding stratum-specific weakness
+      print("\n📊 Out-of-Block R² by demographic stratum:")
+      for stratum in df.loc[clean_mask, 'demographic_stratum'].unique():
+        stratum_mask = clean_mask & (df['demographic_stratum'] == stratum)
+        if stratum_mask.sum() > 1:
+          stratum_r2 = r2_score(
+              df.loc[stratum_mask, target], df.loc[stratum_mask, 'cv_predicted_speed']
+          )
+          print(f"   {stratum}: R² = {stratum_r2:.3f}  (n={stratum_mask.sum()})")
+
+  # Train ultimate model ONLY on reliable-evidence tiles, but predict for ALL rows
+  print("🧠 Training final production model on evidence-threshold subset...")
   final_model = GradientBoostingRegressor(
       n_estimators=100, max_depth=4, random_state=42
   )
-  final_model.fit(df[features], df[target])
+  final_model.fit(train_pool[features], train_pool[target])
   df['predicted_download_kbps'] = final_model.predict(df[features])
+
+  # ---- SHAP explainability ----
+  print("🔍 Computing SHAP feature contributions...")
+  explainer = shap.TreeExplainer(final_model)
+  shap_values = explainer.shap_values(df[features], check_additivity=False)
+
+  top_feature_idx = np.abs(shap_values).argmax(axis=1)
+  df['top_shap_driver'] = [features[i] for i in top_feature_idx]
+  df['top_shap_value'] = shap_values[np.arange(len(df)), top_feature_idx]
 
   # Fallback mapping if CV was bypassed
   if df['cv_predicted_speed'].isna().all():
@@ -129,10 +149,14 @@ def calculate_esg_priority_matrix(df):
       + (df['distance_to_road_m'] / 1000.0) * 0.3
   ).clip(lower=0.1)
 
-  # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr, 65% abatement)
-  df['indicative_abatement_tco2e_yr'] = 34.2 * 0.65
+ 
+  # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr baseline).
+  # Scale the abatement credit by off-grid likelihood so sites more likely
+  # to actually be diesel-dependent get closer to the full GSMA-cited
+  # abatement, rather than crediting every site identically.
+  df['indicative_abatement_tco2e_yr'] = 34.2 * 0.65 * df['off_grid_likelihood'].clip(upper=1.0)
 
-# Underperformance Residual - USE CROSS-VALIDATION
+  # Underperformance Residual
   df['underperformance_residual'] = (
       df['cv_predicted_speed'] - df['download_kbps']
   )
@@ -192,25 +216,15 @@ def apply_governance_confidence_mask(df):
   df['confidence_tier'] = df.apply(assign_mask, axis=1)
   return df
 
+def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
+  # 1. Resolve input file: explicit path > region-based default > error
+  if input_file is None:
+    input_file = os.path.join(data_dir, f"jendela_phase2_esg_matrix_{region}.parquet")
 
-def run_pipeline():
-  # 1. Locate Parquet File
-  data_dir = "data"
-  parquet_files = glob.glob(
-      os.path.join(data_dir, "**", "*.parquet"), recursive=True
-  )
-
-  # Filter out already scored output parquet to prevent self-reading loops
-  parquet_files = [f for f in parquet_files if "_scored.parquet" not in f]
-
-  if not parquet_files:
-    print(
-        f"❌ Error: No raw input .parquet file found in '{data_dir}/'. Please"
-        " extract your parquet file into the 'data/' folder."
-    )
+  if not os.path.exists(input_file):
+    print(f"❌ Input file not found: {input_file}")
     return
 
-  input_file = parquet_files[0]
   print(f"📥 Loading dataset from {input_file}...")
   df = pd.read_parquet(input_file)
   print(f"Loaded {len(df):,} grid tile records.")
@@ -238,13 +252,35 @@ def run_pipeline():
 
   # 3. Execute Pipeline Functions
   df = apply_spatial_blocking_cv(df, features=features, target=target)
-  df = calculate_esg_priority_matrix(df)
-  df = apply_governance_confidence_mask(df)
 
-  # 4. Sort by Priority Score
-  df = df.sort_values(by='priority_score', ascending=False).reset_index(
-      drop=True
+  # 3a. Apply governance mask FIRST
+  governed_df = apply_governance_confidence_mask(df)
+
+  # 3b. Split the dataset so outliers don't ruin the Min-Max scale
+  valid_mask = governed_df['confidence_tier'].str.contains('Sufficient')
+  valid_sites = governed_df[valid_mask].copy()
+  invalid_sites = governed_df[~valid_mask].copy()
+
+  # 3c. Calculate 0-100 scores ONLY on valid sites
+  scored_valid = calculate_esg_priority_matrix(valid_sites)
+
+  # 3d. Zero out the junk sites so they don't get prioritized
+  invalid_sites['priority_score'] = 0.0
+  invalid_sites['people_connected_per_tonne_co2'] = 0.0
+
+  # 3e. Recombine the dataset
+  df = pd.concat([scored_valid, invalid_sites], ignore_index=True)
+
+  df['inference_status'] = 'Candidate Site - Validation Required'
+  df['field_survey_triggered'] = df['confidence_tier'].apply(
+      lambda x: True if 'Sufficient' in x else False
   )
+
+  # 4. Sort by field survey trigger first, then priority score
+  df = df.sort_values(
+      by=['field_survey_triggered', 'priority_score'],
+      ascending=[False, False]
+  ).reset_index(drop=True)
   df['national_rank'] = df.index + 1
 
   # 5. Export Output for Dashboard Lead (Teammate #3)
@@ -268,4 +304,8 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
-  run_pipeline()
+  import sys
+  region_arg = sys.argv[1] if len(sys.argv) > 1 else "malaysia"
+  run_pipeline(region=region_arg)
+
+

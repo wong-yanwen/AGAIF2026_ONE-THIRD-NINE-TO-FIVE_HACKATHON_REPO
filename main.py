@@ -78,7 +78,6 @@ def main():
             'distance_to_power_m', 'distance_to_road_m', 'antenna_count',
             'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr'
         ]
-        
         # Fill missing values to prevent algorithm crash
         master_matrix[exogenous_features] = master_matrix[exogenous_features].fillna(master_matrix[exogenous_features].median())
 
@@ -87,34 +86,34 @@ def main():
         # ==========================================================
         target_variable = 'download_kbps'
         modeled_matrix = apply_spatial_blocking_cv(master_matrix, exogenous_features, target_variable)
-        
+
         # 1. Apply governance mask FIRST
         governed_matrix = apply_governance_confidence_mask(modeled_matrix)
-        
+
         # 2. Split the dataset so outliers don't ruin the Min-Max scale
         valid_mask = governed_matrix['confidence_tier'].str.contains('Sufficient')
         valid_sites = governed_matrix[valid_mask].copy()
         invalid_sites = governed_matrix[~valid_mask].copy()
-        
+
         # 3. Calculate 0-100 scores ONLY on valid sites
         scored_valid = calculate_esg_priority_matrix(valid_sites)
-        
+
         # 4. Zero out the junk sites so they don't get prioritized
         invalid_sites['priority_score'] = 0.0
         invalid_sites['people_connected_per_tonne_co2'] = 0.0
-        
+
         # 5. Recombine the dataset
         final_matrix = pd.concat([scored_valid, invalid_sites], ignore_index=True)
-
+        
+        final_matrix.loc[~final_matrix['confidence_tier'].str.contains('Sufficient'), ['top_shap_driver', 'top_shap_value']] = None
         final_matrix['inference_status'] = 'Candidate Site - Validation Required'
         final_matrix['field_survey_triggered'] = final_matrix['confidence_tier'].apply(
             lambda x: True if 'Sufficient' in x else False
         )
-
-        # 6. Sort and calculate national rank (only ranking the valid sites)
-        final_matrix = final_matrix.sort_values(by=['field_survey_triggered', 'priority_score'], ascending=[False, False]).reset_index(drop=True)
+        final_matrix = final_matrix.sort_values(
+            by=['field_survey_triggered', 'priority_score'], ascending=[False, False]
+        ).reset_index(drop=True)
         final_matrix['national_rank'] = final_matrix.index + 1
-
         final_gdf = gpd.GeoDataFrame(
             final_matrix, 
             geometry=gpd.points_from_xy(final_matrix['longitude'], final_matrix['latitude']), 
@@ -129,6 +128,7 @@ def main():
         dynamic_parquet_path = os.path.join(DATA_DIR, f"jendela_phase2_esg_matrix_{country_suffix}.parquet")
         dynamic_html_path = os.path.join(DATA_DIR, f"jendela_phase2_esg_matrix_{country_suffix}.html")
 
+        # Remove the accidental duplicate save block from your code and use the new dynamic path:
         final_gdf.to_parquet(dynamic_parquet_path, compression='snappy', index=False)
         print(f"\n🚀 Complete ESG Pipeline Operationalized! Matrix saved to: {dynamic_parquet_path}")
         
@@ -143,10 +143,9 @@ def main():
             # Create an interactive map, coloring the points by their Priority Score
             m = final_gdf.explore(
                 column="priority_score",
-                cmap="YlOrRd",          
-                marker_kwds={"radius": 6}, 
-                # ADD THE MISSING COLUMNS HERE:
-                tooltip=["site_id", "national_rank", "is_underserved_target", "priority_score", "confidence_tier", "population_total"],
+                cmap="YlOrRd",          # Yellow-Orange-Red color scale
+                marker_kwds={"radius": 6}, # Size of the dots
+                tooltip=["site_id", "priority_score", "confidence_tier", "population_total"],
                 name="ESG Priority Sites"
             )
             
@@ -172,14 +171,6 @@ def main():
         
         print(f"\n⏹️ Pipeline finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"⏱️ Total Execution Time: {int(hours):02d}h {int(minutes):02d}m {int(seconds):02d}s\n")
-
-       # final check (temp)
-
-        df = pd.read_parquet(dynamic_parquet_path)
-
-        print("is_underserved_target in columns:", "is_underserved_target" in df.columns)
-        print("Total Rows:", len(df))
-        print("Underserved Target Rows:", df["is_underserved_target"].sum())
     
 
 if __name__ == "__main__":
