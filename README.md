@@ -98,4 +98,4 @@ You do NOT need to run `main.py`. Simply download the pre-computed national feat
 
 ## 🤖 AI Transparency Declaration
 
-Team One-third-Nine-to-five acknowledges the use of Gemini 1.5 Pro and Claude 3.5 Sonnet to assist with project brainstorming, code generation, debugging, and presentation design.
+Team One-third-Nine-to-five acknowledges the use of Gemini 3.1 Pro and Claude 5 Sonnet to assist with project brainstorming, code generation, debugging, and presentation design.
