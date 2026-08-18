@@ -31,7 +31,21 @@ ASEAN_BOUNDS = {
     "Laos": [100.1, 13.9, 107.7, 22.5],
     "Brunei": [114.2, 4.0, 115.4, 4.6] 
 }
-
+# Single source of truth for model features — both main.py and
+# model_pipeline.py's run_pipeline() import this, so they can never
+# silently diverge again.
+MODEL_FEATURES = [
+    'population_total',
+    'elevation_m',
+    'slope_degrees',
+    'distance_to_power_m',
+    'distance_to_road_m',
+    'antenna_count',
+    'distance_to_nearest_tower',
+    'night_radiance_nw_cm2_sr',
+    'solar_radiation_mj',
+    'rainfall_mm_hr',
+]
 OOKLA_DATA_URL = 'https://ookla-open-data.s3.us-west-2.amazonaws.com/parquet/performance/type=mobile/year=2023/quarter=4/2023-10-01_performance_mobile_tiles.parquet'
 
 BUFFER_RADIUS_M = 2750  # ~5.5km diameter

@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
-
+from data_pipeline.config import MODEL_FEATURES
 
 def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   """Executes Spatially Blocked Cross-Validation to eliminate spatial autocorrelation data leakage.
@@ -232,18 +232,8 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   df = pd.read_parquet(input_file)
   print(f"Loaded {len(df):,} grid tile records.")
 
-  # 2. Define Features & Target
-  features = [
-      'population_total',
-      'elevation_m',
-      'slope_degrees',
-      'distance_to_road_m',
-      'distance_to_power_m',
-      'night_radiance_nw_cm2_sr',
-      'solar_radiation_mj',
-      'rainfall_mm_hr',
-  ]
-  features = [f for f in features if f in df.columns]
+# 2. Define Features & Target
+  features = [f for f in MODEL_FEATURES if f in df.columns]
   target = 'download_kbps'
 
   # Fallback if target column is named differently

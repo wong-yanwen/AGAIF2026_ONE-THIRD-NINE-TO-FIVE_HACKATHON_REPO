@@ -9,8 +9,7 @@ from data_pipeline.ookla_pipeline import get_underserved_sites, apply_stratified
 from data_pipeline.gee_pipeline import extract_gee_data, clean_and_merge
 from data_pipeline.vector_pipeline import process_vector_proximity
 from data_pipeline.infrastructure_pipeline import process_candidate_site_clusters, engineering_osm_proximity_features
-from data_pipeline.config import OPENCELLID_PATH, OUTPUT_FILE_PATH, ASEAN_MCCS, ASEAN_BOUNDS, DATA_DIR
-
+from data_pipeline.config import OPENCELLID_PATH, OUTPUT_FILE_PATH, ASEAN_MCCS, ASEAN_BOUNDS, DATA_DIR, MODEL_FEATURES
 # Import from the newly created Algorithm Lead module
 from models.model_pipeline import apply_spatial_blocking_cv, calculate_esg_priority_matrix, apply_governance_confidence_mask
 
@@ -73,11 +72,7 @@ def main():
             return
         # --------------------------
 
-        exogenous_features = [
-            'population_total', 'elevation_m', 'slope_degrees', 
-            'distance_to_power_m', 'distance_to_road_m', 'antenna_count',
-            'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr'
-        ]
+        exogenous_features = MODEL_FEATURES
         # Fill missing values to prevent algorithm crash
         master_matrix[exogenous_features] = master_matrix[exogenous_features].fillna(master_matrix[exogenous_features].median())
 
