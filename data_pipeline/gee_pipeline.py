@@ -23,9 +23,22 @@ def build_esg_composite():
     nasadem = ee.Image('NASA/NASADEM_HGT/001')
     elevation = nasadem.select('elevation').rename('elevation')
     slope = ee.Terrain.slope(elevation).rename('slope')
+
+    # Extract terrain aspect (compass direction for solar panel viability)
+    aspect = ee.Terrain.aspect(elevation).rename('aspect')
+
+    # Terrain Ruggedness Index via local elevation standard deviation (3x3 pixel window)
+    ruggedness = elevation.reduceNeighborhood(
+        reducer=ee.Reducer.stdDev(),
+        kernel=ee.Kernel.square(radius=3, units='pixels')
+    ).rename('terrain_ruggedness')
+
     rainfall = ee.ImageCollection('NASA/GPM_L3/IMERG_V07').filterDate('2023-01-01', '2024-01-01').select('precipitation').mean().rename('rainfall')
-    
-    return ee.Image.cat([viirs, era5, worldpop, elevation, slope, rainfall])
+
+    # NEW: Extract 2000-era baseline tree canopy percentage (0-100)
+    tree_canopy = ee.Image('UMD/hansen/global_forest_change_2025_v1_13').select('treecover2000').rename('tree_canopy')
+
+    return ee.Image.cat([viirs, era5, worldpop, elevation, slope, aspect, ruggedness, rainfall, tree_canopy])
 
 def extract_gee_data(df_sites, country_name):
     init_gee()
@@ -47,7 +60,7 @@ def extract_gee_data(df_sites, country_name):
         features = [
             ee.Feature(
                 ee.Geometry.Point(float(row['longitude']), float(row['latitude'])), 
-                {'site_id': int(row['site_id'])}
+                {'site_id': str(row['site_id'])}  # use str, Preserves leading zeros 
             )
             for _, row in chunk_df.iterrows()
         ]
@@ -130,7 +143,8 @@ def extract_gee_data(df_sites, country_name):
             resolved_path = expected_path
 
         print(f"📖 Loading environment metrics from chunk: {resolved_path}")
-        df_chunk = pd.read_csv(resolved_path)
+        # FIX QUADKEY bug: Tell Pandas it is a string before it even loads
+        df_chunk = pd.read_csv(resolved_path, dtype={'site_id': str})
         all_dfs.append(df_chunk)
         
     # Combine all chunks into one massive dataframe to pass downstream
@@ -143,9 +157,18 @@ def clean_and_merge(df_ookla, df_env):
     if df_env.empty:
         raise ValueError("❌ df_env is completely empty. No features were returned from GEE.")
 
+    #=================================================================================
+    # OLD CODE - TO BE DELETED
+    #=================================================================================
+    
     # Standardize 'site_id' columns to string type to resolve the merge conflict
+    #df_ookla['site_id'] = df_ookla['site_id'].astype(str)
+    #df_env['site_id'] = df_env['site_id'].astype(float).astype(int).astype(str)
+    #=================================================================================
+    
+    # Both are clean strings now.
     df_ookla['site_id'] = df_ookla['site_id'].astype(str)
-    df_env['site_id'] = df_env['site_id'].astype(float).astype(int).astype(str)
+    df_env['site_id'] = df_env['site_id'].astype(str)
 
     master_df = pd.merge(df_ookla, df_env, on='site_id', how='inner')
 
@@ -154,10 +177,13 @@ def clean_and_merge(df_ookla, df_env):
     master_df = master_df.rename(columns={
         'elevation_mean': 'elevation_m',
         'slope_mean': 'slope_degrees',
+        'aspect_mean': 'aspect_degrees',
+        'terrain_ruggedness_mean': 'terrain_ruggedness',
         'rainfall_mean': 'rainfall_mm_hr',
         'night_radiance_mean': 'night_radiance_nw_cm2_sr', 
         'population_sum': 'population_total',
-        'solar_radiation_mean': 'solar_radiation_raw'
+        'solar_radiation_mean': 'solar_radiation_raw',
+        'tree_canopy_mean': 'tree_canopy'  
     })
     
     if 'solar_radiation_raw' in master_df.columns:
@@ -165,8 +191,11 @@ def clean_and_merge(df_ookla, df_env):
         
     columns_to_drop = [
         'elevation_sum', 'population_mean', 'night_radiance_sum', 
-        'rainfall_sum', 'slope_sum', 'solar_radiation_sum', 'solar_radiation_raw'
+        'rainfall_sum', 'slope_sum', 'aspect_sum',
+        'solar_radiation_sum', 'solar_radiation_raw', 'terrain_ruggedness_sum',
+        'tree_canopy_sum'
     ]
+    
     master_df = master_df.drop(columns=columns_to_drop, errors='ignore')
     
     # Fill Coastal Zeros from ERA5

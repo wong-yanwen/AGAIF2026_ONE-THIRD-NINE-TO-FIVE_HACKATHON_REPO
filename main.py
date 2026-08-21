@@ -10,7 +10,6 @@ from data_pipeline.gee_pipeline import extract_gee_data, clean_and_merge
 from data_pipeline.vector_pipeline import process_vector_proximity
 from data_pipeline.infrastructure_pipeline import process_candidate_site_clusters, engineering_osm_proximity_features
 from data_pipeline.config import OPENCELLID_PATH, OUTPUT_FILE_PATH, ASEAN_MCCS, ASEAN_BOUNDS, DATA_DIR, MODEL_FEATURES
-# Import from the newly created Algorithm Lead module
 from models.model_pipeline import apply_spatial_blocking_cv, calculate_esg_priority_matrix, apply_governance_confidence_mask
 
 def main():
@@ -70,11 +69,35 @@ def main():
             print(f"\n🛑 Insufficient valid data in {region} to train the model.")
             print("Exiting pipeline gracefully to prevent algorithm crash.\n")
             return
-        # --------------------------
+        # -----------------------------------
 
+        # ==========================================================
+        # DATA INTEGRITY: Domain-Aware Imputation
+        # ==========================================================
+        # 1. Missing antennas = 0 (Do not use median for missing towers)
+        antenna_cols = ['antenna_count', 'antennas_4G', 'antennas_3G', 'antennas_2G', 'antennas_5G']
+        for col in antenna_cols:
+            if col in master_matrix.columns:
+                master_matrix[col] = master_matrix[col].fillna(0)
+                
+        # 2. Missing infrastructure = 10,000m (Extremely remote)
+        distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
+        for col in distance_cols:
+            if col in master_matrix.columns:
+                master_matrix[col] = master_matrix[col].fillna(10000.0)
+
+        # 3. Missing natural geography (safe to use median)
+        geo_cols = ['elevation_m', 'slope_degrees', 'terrain_ruggedness', 'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr', 'tree_canopy']
+        for col in geo_cols:
+            if col in master_matrix.columns:
+                master_matrix[col] = master_matrix[col].fillna(master_matrix[col].median())
+
+        # 4. Now calculate engineered features safely directly on the clean DataFrame
+        master_matrix['congestion_proxy'] = master_matrix['population_total'].fillna(0) / (master_matrix['antenna_count'] + 1)
+        master_matrix['pct_4g_5g'] = (master_matrix['antennas_4G'] + master_matrix['antennas_5G']) / (master_matrix['antenna_count'] + 1)
+        
         exogenous_features = MODEL_FEATURES
-        # Fill missing values to prevent algorithm crash
-        master_matrix[exogenous_features] = master_matrix[exogenous_features].fillna(master_matrix[exogenous_features].median())
+
 
         # ==========================================================
         # ALGORITHM HANDOFF: MODELING, SCORING & GOVERNANCE
@@ -86,16 +109,19 @@ def main():
         governed_matrix = apply_governance_confidence_mask(modeled_matrix)
 
         # 2. Split the dataset so outliers don't ruin the Min-Max scale
-        valid_mask = governed_matrix['confidence_tier'].str.contains('Sufficient')
+        valid_mask = governed_matrix['confidence_tier'].str.contains('Ranked Screening Approved')
         valid_sites = governed_matrix[valid_mask].copy()
         invalid_sites = governed_matrix[~valid_mask].copy()
 
         # 3. Calculate 0-100 scores ONLY on valid sites
         scored_valid = calculate_esg_priority_matrix(valid_sites)
 
+        # ===================================================================
+        # Removed for data integrity
         # 4. Zero out the junk sites so they don't get prioritized
-        invalid_sites['priority_score'] = 0.0
-        invalid_sites['people_connected_per_tonne_co2'] = 0.0
+        # invalid_sites['priority_score'] = 0.0
+        # invalid_sites['people_connected_per_tonne_co2'] = 0.0
+        # ===================================================================
 
         # 5. Recombine the dataset
         final_matrix = pd.concat([scored_valid, invalid_sites], ignore_index=True)
@@ -103,7 +129,7 @@ def main():
         final_matrix.loc[~final_matrix['confidence_tier'].str.contains('Sufficient'), ['top_shap_driver', 'top_shap_value']] = None
         final_matrix['inference_status'] = 'Candidate Site - Validation Required'
         final_matrix['field_survey_triggered'] = final_matrix['confidence_tier'].apply(
-            lambda x: True if 'Sufficient' in x else False
+            lambda x: True if 'Ranked Screening Approved' in x else False
         )
         final_matrix = final_matrix.sort_values(
             by=['field_survey_triggered', 'priority_score'], ascending=[False, False]

@@ -38,6 +38,7 @@ MODEL_FEATURES = [
     'population_total',
     'elevation_m',
     'slope_degrees',
+    'terrain_ruggedness',
     'distance_to_power_m',
     'distance_to_road_m',
     'antenna_count',
@@ -45,6 +46,13 @@ MODEL_FEATURES = [
     'night_radiance_nw_cm2_sr',
     'solar_radiation_mj',
     'rainfall_mm_hr',
+    'congestion_proxy', 
+    'pct_4g_5g', 
+    'antennas_4G',         # Changed from radio_LTE
+    'antennas_3G',         # Changed from radio_UMTS
+    'antennas_2G',         # Changed from radio_GSM
+    'antennas_5G',         # Changed from radio_NR
+    'tree_canopy'  
 ]
 OOKLA_DATA_URL = 'https://ookla-open-data.s3.us-west-2.amazonaws.com/parquet/performance/type=mobile/year=2023/quarter=4/2023-10-01_performance_mobile_tiles.parquet'
 

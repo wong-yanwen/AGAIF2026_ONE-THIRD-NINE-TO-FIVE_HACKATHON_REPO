@@ -21,6 +21,18 @@ def process_candidate_site_clusters(df_raw, eps_meters=500, min_samples=1):
     """
     print("🗼 Clustering raw OpenCelliD antennas into unified physical sites...")
     
+    # One-Hot Encode the radio technologies
+    if 'radio' in df_raw.columns:
+        radio_dummies = pd.get_dummies(df_raw['radio'], prefix='radio', dummy_na=False)
+        df_raw = pd.concat([df_raw, radio_dummies], axis=1)
+        
+    # Ensure standard columns exist so downstream ML models don't crash 
+    # if a specific region lacks 5G (NR) or older techs.
+    expected_radios = ['radio_LTE', 'radio_UMTS', 'radio_GSM', 'radio_NR']
+    for r in expected_radios:
+        if r not in df_raw.columns:
+            df_raw[r] = 0
+    
     # Convert to GeoDataFrame
     gdf = gpd.GeoDataFrame(
         df_raw, 
@@ -40,16 +52,29 @@ def process_candidate_site_clusters(df_raw, eps_meters=500, min_samples=1):
     clustering = DBSCAN(eps=eps_meters, min_samples=min_samples).fit(coords)
     gdf_metric['cluster_id'] = clustering.labels_
     
-    # Aggregate back to single site points (centroids of clusters)
-    clustered_sites = gdf_metric.dissolve(by='cluster_id', aggfunc={
+    # Dynamic aggregation dictionary to sum up all radio types
+    agg_dict = {
         'radio': 'count', 
-        'range': 'mean'
-    }).reset_index()
+        'range': 'mean',
+        'radio_LTE': 'sum',
+        'radio_UMTS': 'sum',
+        'radio_GSM': 'sum',
+        'radio_NR': 'sum'
+    }
+    
+    # Aggregate back to single site points (centroids of clusters)
+    clustered_sites = gdf_metric.dissolve(by='cluster_id', aggfunc=agg_dict).reset_index()
 
     # Convert the dissolved MultiPoint clusters into single Point centroids
     clustered_sites['geometry'] = clustered_sites['geometry'].centroid
 
-    clustered_sites = clustered_sites.rename(columns={'radio': 'antenna_count'})
+    clustered_sites = clustered_sites.rename(columns={
+        'radio': 'antenna_count',
+        'radio_LTE': 'antennas_4G',
+        'radio_UMTS': 'antennas_3G',
+        'radio_GSM': 'antennas_2G',
+        'radio_NR': 'antennas_5G'
+    })
     
     # Revert back to standard GPS coordinates for downstream GEE merging
     return clustered_sites.to_crs("EPSG:4326")

@@ -25,9 +25,10 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
       df['lat_block'].astype(str) + "_" + df['lon_block'].astype(str)
   )
 
-  # Only fit/validate on tiles with reliable Ookla labels (evidence threshold).
-  evidence_mask = (df['tests'] >= 15) & (df['devices'] >= 5) & (df['is_underserved_target'] == True)
-  train_pool = df[evidence_mask].copy()
+  # Only fit/validate on explicitly flagged underserved target tiles.
+  # (The 'is_underserved_target' flag already checks for tests >= 15 and devices >= 5)
+  target_mask = df['is_underserved_target'] == True
+  train_pool = df[target_mask].copy()
   print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
 
   unique_blocks = np.array(sorted(train_pool['spatial_block'].unique()))
@@ -61,10 +62,14 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
         continue
 
       model = GradientBoostingRegressor(
-          n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42
+          n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42
       )
+      
+
+      # Fit standard target directly
       model.fit(train_data[features], train_data[target])
 
+      # Predict standard scale
       preds = model.predict(val_data[features])
       df.loc[val_data.index, 'cv_predicted_speed'] = preds
 
@@ -92,9 +97,12 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   # Train ultimate model ONLY on reliable-evidence tiles, but predict for ALL rows
   print("🧠 Training final production model on evidence-threshold subset...")
   final_model = GradientBoostingRegressor(
-      n_estimators=100, max_depth=4, random_state=42
+      n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42
   )
+  # Fit standard target directly
   final_model.fit(train_pool[features], train_pool[target])
+  
+  # Predict standard scale
   df['predicted_download_kbps'] = final_model.predict(df[features])
 
   # Rows outside the training pool never get a CV-validated prediction;
@@ -117,32 +125,42 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
 
 def calculate_esg_priority_matrix(df):
   """Derives Energy Burden Indices and synthesizes the Joint Priority Score
-
   (normalized to 0–100 for human readability).
   """
   print("🔋 Computing Energy Burden and Carbon Abatement Matrix...")
 
   # Fallbacks for missing vector distances
-  df['distance_to_power_m'] = df['distance_to_power_m'].fillna(
-      df['distance_to_power_m'].median()
-  )
-  df['distance_to_road_m'] = df['distance_to_road_m'].fillna(
-      df['distance_to_road_m'].median()
-  )
+  # A missing value means the infrastructure is far outside the local bounding box.
+  df['distance_to_power_m'] = df['distance_to_power_m'].fillna(10000.0)
+  df['distance_to_road_m'] = df['distance_to_road_m'].fillna(10000.0)
   df['distance_to_amenity_m'] = df['distance_to_amenity_m'].fillna(10000.0)
 
-  # Off-Grid Likelihood
+  # Updated Off-Grid Likelihood Formula 
   df['off_grid_likelihood'] = (
-      (df['distance_to_power_m'] / 5000.0) * 0.5
-      + (df['distance_to_road_m'] / 2000.0) * 0.3
-      + (1.0 / (df['night_radiance_nw_cm2_sr'] + 0.1)) * 0.2
+      (df['distance_to_power_m'] / 5000.0).clip(upper=1.0) * 0.35
+      + (df['distance_to_road_m'] / 2000.0).clip(upper=1.0) * 0.25
+      + (1.0 / (df['night_radiance_nw_cm2_sr'] + 0.1)) * 0.25
+      + (df['population_total'] / 1000.0).clip(upper=1.0) * 0.15 
   )
+
+  # Dynamic Solar Aspect Logic (Scalable across the equator)
+  # Northern Hemisphere (>0) prefers South (180). Southern Hemisphere (<0) prefers North (0).
+  optimal_aspect = np.where(df['latitude'] > 0, 180.0, 0.0)
+  
+  # Calculate shortest angular distance (0 to 180 degrees off from optimal)
+  aspect_diff = np.abs(df['aspect_degrees'] - optimal_aspect)
+  aspect_diff = np.minimum(aspect_diff, 360.0 - aspect_diff)
+  
+  # Convert to a 0-1 multiplier (1 = perfect orientation, 0 = completely backward)
+  aspect_score = 1.0 - (aspect_diff / 180.0)
 
   # Solar Viability
   df['solar_viability'] = (
-      (df['solar_radiation_mj'] / df['solar_radiation_mj'].max()) * 0.6
-      + (1.0 / (df['slope_degrees'] + 1.0)) * 0.4
+      (df['solar_radiation_mj'] / df['solar_radiation_mj'].max()) * 0.5
+      + (1.0 / (df['slope_degrees'] + 1.0)) * 0.3
+      + aspect_score * 0.2 
   ) - (df['rainfall_mm_hr'] * 0.1)
+  
   df['solar_viability'] = df['solar_viability'].clip(lower=0.1)
 
   # Logistics Difficulty
@@ -150,13 +168,27 @@ def calculate_esg_priority_matrix(df):
       (df['slope_degrees'] / 15.0) * 0.4
       + (df['elevation_m'] / 1000.0) * 0.3
       + (df['distance_to_road_m'] / 1000.0) * 0.3
+      + (df['terrain_ruggedness'] / 50.0) * 0.2  # NEW: Penalize highly rugged terrain
   ).clip(lower=0.1)
 
+  # CO2 Threshold Gate
   # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr baseline).
-  # Scale the abatement credit by off-grid likelihood so sites more likely
-  # to actually be diesel-dependent get closer to the full GSMA-cited
-  # abatement, rather than crediting every site identically.
-  df['indicative_abatement_tco2e_yr'] = 34.2 * 0.65 * df['off_grid_likelihood'].clip(upper=1.0)
+  # We multiply by likelihood here so the dashboard displays the EXPECTED actual savings
+  expected_abatement = 34.2 * 0.65 * df['off_grid_likelihood'].clip(upper=1.0)
+  
+  df['indicative_abatement_tco2e_yr'] = np.where(
+      df['off_grid_likelihood'] < 0.10,
+      0.0,
+      expected_abatement
+  )
+
+  # OPEX Savings for the Dashboard Lead (US$17,000/yr off-grid baseline)
+  opex_credit = 17000 * df['off_grid_likelihood'].clip(upper=1.0)
+  df['indicative_opex_saving_usd'] = np.where(
+      df['off_grid_likelihood'] < 0.10,
+      0.0,
+      opex_credit
+  )
 
   # Underperformance Residual
   df['underperformance_residual'] = (
@@ -172,10 +204,11 @@ def calculate_esg_priority_matrix(df):
   )
 
   # Raw Priority Score Equation
+  # Note: off_grid_likelihood is removed from this equation because it is already 
+  # mathematically baked into indicative_abatement_tco2e_yr
   numerator = (
       (
           df['indicative_abatement_tco2e_yr']
-          * df['off_grid_likelihood']
           * df['solar_viability']
       )
       * (df['population_total'] + df['essential_service_weight'])
@@ -196,28 +229,35 @@ def calculate_esg_priority_matrix(df):
     df['priority_score'] = 50.0
 
   # Core Pitch Metric: People connected per tonne of CO2 avoided
-  df['people_connected_per_tonne_co2'] = (
-      df['population_total'] / df['indicative_abatement_tco2e_yr']
+  # Handled safely to prevent `inf` corruption in downstream datasets
+  df['people_connected_per_tonne_co2'] = np.where(
+      df['indicative_abatement_tco2e_yr'] > 0,
+      df['population_total'] / df['indicative_abatement_tco2e_yr'],
+      0.0
   )
 
   return df
 
-
 def apply_governance_confidence_mask(df):
-  """Implements the three-tier data governance visibility mask."""
-  print("🛡️ Deploying Data Governance Integrity Mask...")
+    """Implements the three-tier data governance visibility mask."""
+    print("🛡️ Deploying Data Governance Integrity Mask...")
 
-  def assign_mask(row):
-    if row['tests'] >= 15 and row['devices'] >= 5:
-      return 'Sufficient Evidence - Ranked Screening Approved'
-    elif row['tests'] > 0:
-      return 'Thin Evidence - Masked from Prioritization'
-    else:
-      return 'No Data - Excluded'
+    def assign_mask(row):
+        # Added distance check to enforce the "has OpenCelliD records" rule
+        has_tower_nearby = row.get('distance_to_nearest_tower', 99999) <= 2750
 
-  df['confidence_tier'] = df.apply(assign_mask, axis=1)
-  return df
+        if row['tests'] >= 15 and row['devices'] >= 5 and has_tower_nearby:
+            if row.get('is_underserved_target', False):
+                return 'Sufficient Evidence - Ranked Screening Approved'
+            else:
+                return 'Sufficient Evidence - Performing Above Baseline (Excluded)'
+        elif row['tests'] > 0:
+            return 'Thin Evidence - Masked from Prioritization'
+        else:
+            return 'No Data - Excluded'
 
+    df['confidence_tier'] = df.apply(assign_mask, axis=1)
+    return df
 
 def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   # 1. Resolve input file: explicit path > region-based default > error
@@ -231,6 +271,31 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   print(f"📥 Loading dataset from {input_file}...")
   df = pd.read_parquet(input_file)
   print(f"Loaded {len(df):,} grid tile records.")
+
+  # ==========================================================
+  # DATA INTEGRITY: Domain-Aware Imputation
+  # ==========================================================
+  # 1. Missing antennas = 0 (Do not use median for missing towers)
+  antenna_cols = ['antenna_count', 'antennas_4G', 'antennas_3G', 'antennas_2G', 'antennas_5G']
+  for col in antenna_cols:
+      if col in df.columns:
+          df[col] = df[col].fillna(0)
+          
+  # 2. Missing infrastructure = 10,000m (Extremely remote)
+  distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
+  for col in distance_cols:
+      if col in df.columns:
+          df[col] = df[col].fillna(10000.0)
+
+  # 3. Missing natural geography (safe to use median)
+  geo_cols = ['elevation_m', 'slope_degrees', 'terrain_ruggedness', 'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr']
+  for col in geo_cols:
+      if col in df.columns:
+          df[col] = df[col].fillna(df[col].median())
+
+  # 4. Now calculate engineered features safely directly on the clean DataFrame
+  df['congestion_proxy'] = df['population_total'].fillna(0) / (df['antenna_count'] + 1)
+  df['pct_4g_5g'] = (df['antennas_4G'] + df['antennas_5G']) / (df['antenna_count'] + 1)
 
 # 2. Define Features & Target
   features = [f for f in MODEL_FEATURES if f in df.columns]
@@ -250,23 +315,26 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   governed_df = apply_governance_confidence_mask(df)
 
   # 3b. Split the dataset so outliers don't ruin the Min-Max scale
-  valid_mask = governed_df['confidence_tier'].str.contains('Sufficient')
+  valid_mask = governed_df['confidence_tier'].str.contains('Ranked Screening Approved')
   valid_sites = governed_df[valid_mask].copy()
   invalid_sites = governed_df[~valid_mask].copy()
 
   # 3c. Calculate 0-100 scores ONLY on valid sites
   scored_valid = calculate_esg_priority_matrix(valid_sites)
 
+  # ===================================================================
+  # Removed for data integrity
   # 3d. Zero out the junk sites so they don't get prioritized
-  invalid_sites['priority_score'] = 0.0
-  invalid_sites['people_connected_per_tonne_co2'] = 0.0
+  # invalid_sites['priority_score'] = 0.0
+  # invalid_sites['people_connected_per_tonne_co2'] = 0.0
+  # ===================================================================
 
   # 3e. Recombine the dataset
   df = pd.concat([scored_valid, invalid_sites], ignore_index=True)
 
   df['inference_status'] = 'Candidate Site - Validation Required'
   df['field_survey_triggered'] = df['confidence_tier'].apply(
-      lambda x: True if 'Sufficient' in x else False
+      lambda x: True if 'Ranked Screening Approved' in x else False
   )
 
   # 4. Sort by field survey trigger first, then priority score

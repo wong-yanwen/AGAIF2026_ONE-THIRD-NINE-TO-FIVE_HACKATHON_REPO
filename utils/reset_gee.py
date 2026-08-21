@@ -12,6 +12,6 @@ print("🔑 Opening browser for mandatory project selection...")
 ee.Authenticate(auth_mode='notebook', force=True) #
 
 # 3. Test Initialization 
-NEW_PROJECT_ID = 'ee-one-third-nine-to-five-v3'
+NEW_PROJECT_ID = 'ee-one-third-nine-to-five-v6'
 ee.Initialize(project=NEW_PROJECT_ID) #
 print(f"🚀 SUCCESS! Earth Engine is fully locked to project: {NEW_PROJECT_ID}")
