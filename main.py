@@ -4,7 +4,6 @@ import pandas as pd
 import geopandas as gpd
 from datetime import datetime
 
-
 from data_pipeline.ookla_pipeline import get_underserved_sites, apply_stratified_ookla_screening
 from data_pipeline.gee_pipeline import extract_gee_data, clean_and_merge
 from data_pipeline.vector_pipeline import process_vector_proximity
@@ -47,6 +46,7 @@ def main():
     #site_nodes_final['distance_to_power_m'] = 1500.0  # Fake distance to power lines
     #site_nodes_final['distance_to_road_m'] = 300.0    # Fake distance to roads
     #site_nodes_final['distance_to_amenity_m'] = 4500.0 # Fake distance to schools/clinics
+    #site_nodes_final['distance_to_tier1_hub_m'] = 25000.0 # Fake distance to Tier 1 hub
     # --------------------------------------------------------------------------------------
     
     # ACTUAL 
@@ -81,7 +81,7 @@ def main():
                 master_matrix[col] = master_matrix[col].fillna(0)
                 
         # 2. Missing infrastructure = 10,000m (Extremely remote)
-        distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
+        distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
         for col in distance_cols:
             if col in master_matrix.columns:
                 master_matrix[col] = master_matrix[col].fillna(10000.0)
@@ -172,7 +172,7 @@ def main():
             
             m.save(dynamic_html_path)
             
-            # Automatically open the map in your default web browser
+            # Automatically open the map in the default web browser
             webbrowser.open('file://' + os.path.realpath(dynamic_html_path))
             print(f"✅ Map saved and opened in your browser: {dynamic_html_path}")
             

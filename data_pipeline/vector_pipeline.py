@@ -43,6 +43,7 @@ def process_vector_proximity(df_underserved, site_nodes_final, region):
             arg_min(s.distance_to_power_m, ST_Distance(u.geometry, s.geometry)) AS distance_to_power_m,
             arg_min(s.distance_to_road_m, ST_Distance(u.geometry, s.geometry)) AS distance_to_road_m,
             arg_min(s.distance_to_amenity_m, ST_Distance(u.geometry, s.geometry)) AS distance_to_amenity_m,
+            arg_min(s.distance_to_tier1_hub_m, ST_Distance(u.geometry, s.geometry)) AS distance_to_tier1_hub_m,
             arg_min(s.antenna_count, ST_Distance(u.geometry, s.geometry)) AS antenna_count,
             arg_min(s.antennas_4G, ST_Distance(u.geometry, s.geometry)) AS antennas_4G,
             arg_min(s.antennas_3G, ST_Distance(u.geometry, s.geometry)) AS antennas_3G,

@@ -107,6 +107,7 @@ def fetch_overture_layer(gdf_sites, region_name, layer_name):
     con.execute("INSTALL spatial; LOAD spatial;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET s3_region='us-west-2';")
+    con.execute("SET http_keep_alive=false;") # prevent infinite hanging
     
     # 2. Extract geometry AS WKB (Well-Known Binary) for GeoPandas compatibility
     if layer_name == "power":
@@ -132,6 +133,14 @@ def fetch_overture_layer(gdf_sites, region_name, layer_name):
             WHERE bbox.xmax >= {min_lon} AND bbox.xmin <= {max_lon}
             AND bbox.ymax >= {min_lat} AND bbox.ymin <= {max_lat}
             AND categories.primary IN ('school', 'hospital', 'clinic')
+        """
+    elif layer_name == "tier1_hubs":
+        query = f"""
+            SELECT ST_AsWKB(geometry) as geom_wkb, subtype as osm_type
+            FROM read_parquet('{release_path}/theme=divisions/type=division/*', filename=true, hive_partitioning=1)
+            WHERE bbox.xmax >= {min_lon} AND bbox.xmin <= {max_lon}
+            AND bbox.ymax >= {min_lat} AND bbox.ymin <= {max_lat}
+            AND subtype = 'locality'
         """
     else:
         raise ValueError("Invalid layer name requested.")
@@ -168,13 +177,18 @@ def engineering_osm_proximity_features(gdf_sites, region_name):
     dynamic_epsg = get_utm_crs(avg_lon)
     sites_metric = gdf_sites.to_crs(dynamic_epsg)
    
-    for layer_name in ["power", "roads", "amenities"]:
+    for layer_name in ["power", "roads", "amenities", "tier1_hubs"]:
         print(f"📥 Extracting chunked vectors for layer: {layer_name}")
-       
+
         raw_osm = fetch_overture_layer(gdf_sites, region_name, layer_name)
 
-        # Explicitly map the layer names to the expected downstream column names
-        name_map = {"power": "power", "roads": "road", "amenities": "amenity"}
+        # MAP the layer to its column name
+        name_map = {
+            "power": "power", 
+            "roads": "road", 
+            "amenities": "amenity", 
+            "tier1_hubs": "tier1_hub"
+        }
         target_col = f"distance_to_{name_map[layer_name]}_m"
 
         if raw_osm.empty:

@@ -52,7 +52,8 @@ MODEL_FEATURES = [
     'antennas_3G',         # Changed from radio_UMTS
     'antennas_2G',         # Changed from radio_GSM
     'antennas_5G',         # Changed from radio_NR
-    'tree_canopy'  
+    'tree_canopy',
+    'distance_to_tier1_hub_m'
 ]
 OOKLA_DATA_URL = 'https://ookla-open-data.s3.us-west-2.amazonaws.com/parquet/performance/type=mobile/year=2023/quarter=4/2023-10-01_performance_mobile_tiles.parquet'
 

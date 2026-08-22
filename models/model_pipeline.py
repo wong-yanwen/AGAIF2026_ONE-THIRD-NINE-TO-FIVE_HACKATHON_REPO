@@ -282,13 +282,13 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
           df[col] = df[col].fillna(0)
           
   # 2. Missing infrastructure = 10,000m (Extremely remote)
-  distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
+  distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
   for col in distance_cols:
       if col in df.columns:
           df[col] = df[col].fillna(10000.0)
 
   # 3. Missing natural geography (safe to use median)
-  geo_cols = ['elevation_m', 'slope_degrees', 'terrain_ruggedness', 'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr']
+  geo_cols = ['elevation_m', 'slope_degrees', 'terrain_ruggedness', 'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr', 'tree_canopy']
   for col in geo_cols:
       if col in df.columns:
           df[col] = df[col].fillna(df[col].median())
