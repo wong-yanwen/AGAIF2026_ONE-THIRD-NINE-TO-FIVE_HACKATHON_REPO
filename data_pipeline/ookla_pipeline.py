@@ -77,8 +77,11 @@ def apply_stratified_ookla_screening(gdf_ookla):
     valid_tiles = gdf_ookla[valid_mask].copy()
 
     if len(valid_tiles) == 0:
-        print("⚠️ No tiles met the baseline evidence threshold.")
-        return gdf_ookla
+       print("⚠️ No tiles met the baseline evidence threshold.")
+       # --- THE FIX: Inject the missing schema before returning ---
+       gdf_ookla['demographic_stratum'] = 'unknown'
+       gdf_ookla['is_underserved_target'] = False
+       return gdf_ookla
 
     # 2. Establish population boundaries
     cutoffs = valid_tiles['population_total'].quantile([0.33, 0.66]).values

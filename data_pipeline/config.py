@@ -28,8 +28,8 @@ ASEAN_BOUNDS = {
     "Singapore": [103.6, 1.15, 104.1, 1.48],
     "Cambodia": [102.3, 10.4, 107.6, 14.7],
     "Myanmar": [92.2, 9.6, 101.2, 28.5],
-    "Laos": [100.1, 13.9, 107.7, 22.5],
-    "Brunei": [114.2, 4.0, 115.4, 4.6] 
+    "Laos DR": [100.1, 13.9, 107.7, 22.5],
+    "Brunei Darussalam": [114.2, 4.0, 115.4, 4.6] 
 }
 # Single source of truth for model features — both main.py and
 # model_pipeline.py's run_pipeline() import this, so they can never

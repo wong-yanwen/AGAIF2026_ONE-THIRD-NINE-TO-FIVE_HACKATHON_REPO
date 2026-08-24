@@ -31,6 +31,18 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   train_pool = df[target_mask].copy()
   print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
 
+  # --- NEW: SAFE BYPASS FOR SMALL/WEALTHY REGIONS ---
+  if len(train_pool) < 10:
+    print(f"⚠️ Insufficient training data ({len(train_pool)} target tiles). Bypassing ML model.")
+    # Default predictions to actuals so residual becomes 0
+    df['cv_predicted_speed'] = df['download_kbps']
+    df['predicted_download_kbps'] = df['download_kbps']
+    df['top_shap_driver'] = 'Insufficient Data'
+    df['top_shap_value'] = 0.0
+    return df
+  # --------------------------------------------------
+
+
   unique_blocks = np.array(sorted(train_pool['spatial_block'].unique()))
   num_blocks = len(unique_blocks)
 
@@ -314,54 +326,61 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   # 3a. Apply governance mask FIRST
   governed_df = apply_governance_confidence_mask(df)
 
-  # 3b. Split the dataset so outliers don't ruin the Min-Max scale
+  # 3b. Check for valid targets BEFORE splitting or scoring
   valid_mask = governed_df['confidence_tier'].str.contains('Ranked Screening Approved')
-  valid_sites = governed_df[valid_mask].copy()
-  invalid_sites = governed_df[~valid_mask].copy()
-
-  # 3c. Calculate 0-100 scores ONLY on valid sites
-  scored_valid = calculate_esg_priority_matrix(valid_sites)
-
-  # ===================================================================
-  # Removed for data integrity
-  # 3d. Zero out the junk sites so they don't get prioritized
-  # invalid_sites['priority_score'] = 0.0
-  # invalid_sites['people_connected_per_tonne_co2'] = 0.0
-  # ===================================================================
-
-  # 3e. Recombine the dataset
-  df = pd.concat([scored_valid, invalid_sites], ignore_index=True)
-
-  df['inference_status'] = 'Candidate Site - Validation Required'
-  df['field_survey_triggered'] = df['confidence_tier'].apply(
-      lambda x: True if 'Ranked Screening Approved' in x else False
-  )
-
-  # 4. Sort by field survey trigger first, then priority score
-  df = df.sort_values(
-      by=['field_survey_triggered', 'priority_score'],
-      ascending=[False, False]
-  ).reset_index(drop=True)
-  df['national_rank'] = df.index + 1
-
+  
+  if not valid_mask.any():
+      print("⚠️ ZERO valid target sites found in region. Injecting neutral schema.")
+      df = governed_df.copy()
+      
+      empty_cols = [
+          'top_shap_driver', 'top_shap_value', 'off_grid_likelihood', 
+          'solar_viability', 'logistics_difficulty', 'indicative_abatement_tco2e_yr', 
+          'indicative_opex_saving_usd', 'underperformance_residual', 
+          'essential_service_weight', 'priority_score', 'people_connected_per_tonne_co2'
+      ]
+      for col in empty_cols:
+          df[col] = np.nan
+          
+      df['inference_status'] = 'No Action Required - Performing Above Baseline'
+      df['field_survey_triggered'] = False
+      df['national_rank'] = 0
+      
+  else:
+      valid_sites = governed_df[valid_mask].copy()
+      invalid_sites = governed_df[~valid_mask].copy()
+      
+      scored_valid = calculate_esg_priority_matrix(valid_sites)
+      
+      df = pd.concat([scored_valid, invalid_sites], ignore_index=True)
+      df.loc[~df['confidence_tier'].str.contains('Sufficient'), ['top_shap_driver', 'top_shap_value']] = None
+      df['inference_status'] = 'Candidate Site - Validation Required'
+      df['field_survey_triggered'] = df['confidence_tier'].apply(
+          lambda x: True if 'Ranked Screening Approved' in x else False
+      )
+      df = df.sort_values(
+          by=['field_survey_triggered', 'priority_score'], ascending=[False, False]
+      ).reset_index(drop=True)
+      df['national_rank'] = df.index + 1
+      
   # 5. Export Output for Dashboard Lead (Teammate #3)
   output_path = os.path.join(data_dir, "jendela_phase2_esg_scored.parquet")
   df.to_parquet(output_path, index=False)
   print(f"✅ Successfully exported scored priority matrix to '{output_path}'!")
 
-  # Quick Top-5 Summary
-  print("\n🏆 Top 5 Priority Sites Preview:")
-  cols_to_show = [
-      c
-      for c in [
+ # Quick Top-5 Summary
+  if not valid_mask.any():
+      print("\n🏆 No valid sites to rank for this region.")
+  else:
+      print("\n🏆 Top 5 Priority Sites Preview:")
+      cols_to_show = [
           'national_rank',
           'priority_score',
           'people_connected_per_tonne_co2',
           'confidence_tier',
       ]
-      if c in df.columns
-  ]
-  print(df[cols_to_show].head(5).to_string(index=False))
+      valid_cols = [c for c in cols_to_show if c in df.columns]
+      print(df[valid_cols].head(5).to_string(index=False))
 
 
 if __name__ == "__main__":
