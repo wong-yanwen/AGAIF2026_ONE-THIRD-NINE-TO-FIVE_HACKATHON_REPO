@@ -88,6 +88,15 @@ def main(region_name="Malaysia"):
                 master_matrix[col] = master_matrix[col].fillna(0)
                 
         # 2. Missing infrastructure = 10,000m (Extremely remote)
+        # Preserve original missingness BEFORE imputation — flagging after
+        # fillna() always reads False, since the NaN is already gone by then.
+        if 'distance_to_power_m' in master_matrix.columns:
+            master_matrix['power_distance_missing'] = master_matrix['distance_to_power_m'].isna()
+        if 'distance_to_road_m' in master_matrix.columns:
+            master_matrix['road_distance_missing'] = master_matrix['distance_to_road_m'].isna()
+        if 'distance_to_amenity_m' in master_matrix.columns:
+            master_matrix['amenity_distance_missing'] = master_matrix['distance_to_amenity_m'].isna()
+
         distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
         for col in distance_cols:
             if col in master_matrix.columns:
@@ -103,7 +112,10 @@ def main(region_name="Malaysia"):
         master_matrix['congestion_proxy'] = master_matrix['population_total'].fillna(0) / (master_matrix['antenna_count'] + 1)
         master_matrix['pct_4g_5g'] = (master_matrix['antennas_4G'] + master_matrix['antennas_5G']) / (master_matrix['antenna_count'] + 1)
         
-        exogenous_features = MODEL_FEATURES
+        missing_features = [f for f in MODEL_FEATURES if f not in master_matrix.columns]
+        if missing_features:
+            print(f"⚠️ Missing model features for this region: {missing_features}")
+        exogenous_features = [f for f in MODEL_FEATURES if f in master_matrix.columns]
 
 
         # ==========================================================
@@ -116,7 +128,7 @@ def main(region_name="Malaysia"):
         governed_matrix = apply_governance_confidence_mask(modeled_matrix)
 
         # 2. Check for valid targets BEFORE splitting or scoring
-        valid_mask = governed_matrix['confidence_tier'].str.contains('Ranked Screening Approved')
+        valid_mask = governed_matrix['confidence_tier'] == 'Sufficient Evidence - Ranked Screening Approved'
         
         if not valid_mask.any():
             print("⚠️ ZERO valid target sites found in region. Injecting neutral schema for UI lead.")
@@ -125,8 +137,11 @@ def main(region_name="Malaysia"):
             # Manually inject the schema your UI lead expects from calculate_esg_priority_matrix
             expected_cols = [
                 'off_grid_likelihood', 'solar_viability', 'logistics_difficulty', 
-                'indicative_abatement_tco2e_yr', 'indicative_opex_saving_usd', 
-                'underperformance_residual', 'essential_service_weight', 
+                'indicative_abatement_tco2e_yr', 'indicative_opex_saving_usd',
+                'grid_equivalent_tco2e_yr', 'underperformance_residual',
+                'essential_service_weight', 'community_impact',
+                'off_grid_score_n', 'solar_score_n', 'community_impact_n',
+                'access_ease_n', 'diesel_gate', 'service_shortfall_n',
                 'priority_score', 'people_connected_per_tonne_co2'
             ]
             for col in expected_cols:
@@ -142,17 +157,35 @@ def main(region_name="Malaysia"):
             invalid_sites = governed_matrix[~valid_mask].copy()
             
             scored_valid = calculate_esg_priority_matrix(valid_sites)
-            
+            invalid_sites['priority_score'] = 0.0
+            invalid_sites['community_impact'] = 0.0
+            invalid_sites['people_connected_per_tonne_co2'] = 0.0
             final_matrix = pd.concat([scored_valid, invalid_sites], ignore_index=True)
             final_matrix.loc[~final_matrix['confidence_tier'].str.contains('Sufficient'), ['top_shap_driver', 'top_shap_value']] = None
-            final_matrix['inference_status'] = 'Candidate Site - Validation Required'
+            final_matrix['inference_status'] = np.select(
+                [
+                    final_matrix['confidence_tier'] == 'Sufficient Evidence - Ranked Screening Approved',
+                    final_matrix['confidence_tier'] == 'Sufficient Evidence - Performing Above Baseline (Excluded)',
+                    final_matrix['confidence_tier'] == 'Thin Evidence - Masked from Prioritization'
+                ],
+                [
+                    'Candidate Site - Validation Required',
+                    'Excluded - Performing Above Baseline',
+                    'Insufficient Evidence - Additional Data Required'
+                ],
+                default='Excluded - No Data'
+            )
             final_matrix['field_survey_triggered'] = final_matrix['confidence_tier'].apply(
                 lambda x: True if 'Ranked Screening Approved' in x else False
             )
             final_matrix = final_matrix.sort_values(
                 by=['field_survey_triggered', 'priority_score'], ascending=[False, False]
             ).reset_index(drop=True)
-            final_matrix['national_rank'] = final_matrix.index + 1
+            # Only candidate sites get a national rank — see model_pipeline.py
+            # for why excluded/thin-evidence sites are set to 0 instead.
+            final_matrix['national_rank'] = 0
+            rank_mask = final_matrix['field_survey_triggered']
+            final_matrix.loc[rank_mask, 'national_rank'] = np.arange(1, rank_mask.sum() + 1)
 
         # ==========================================================
         # EXPORT FOR UI LEAD

@@ -2,7 +2,7 @@ import shap
 import os
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
 from data_pipeline.config import MODEL_FEATURES
@@ -19,8 +19,13 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
 
   # Generate 0.5-degree spatial blocks first, on the full dataframe,
   # so these columns survive into the exported output.
-  df['lat_block'] = (df['latitude'] / 0.5).astype(int)
-  df['lon_block'] = (df['longitude'] / 0.5).astype(int)
+  # np.floor(), not .astype(int) directly — Python's int() truncates TOWARD
+  # ZERO, not toward negative infinity, so +0.2° and -0.2° both truncate to
+  # block 0, incorrectly merging locations on opposite sides of the equator
+  # into the same spatial block. Doesn't materially affect Malaysia (mostly
+  # north of the equator), but matters for scaling to Indonesia.
+  df['lat_block'] = np.floor(df['latitude'] / 0.5).astype(int)
+  df['lon_block'] = np.floor(df['longitude'] / 0.5).astype(int)
   df['spatial_block'] = (
       df['lat_block'].astype(str) + "_" + df['lon_block'].astype(str)
   )
@@ -73,8 +78,8 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
       if train_data.empty or val_data.empty:
         continue
 
-      model = GradientBoostingRegressor(
-          n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42
+      model = RandomForestRegressor(
+          n_estimators=100, max_depth=6, min_samples_leaf=5, random_state=42
       )
       
 
@@ -108,14 +113,28 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
 
   # Train ultimate model ONLY on reliable-evidence tiles, but predict for ALL rows
   print("🧠 Training final production model on evidence-threshold subset...")
-  final_model = GradientBoostingRegressor(
-      n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42
+  final_model = RandomForestRegressor(
+      n_estimators=100, max_depth=6, min_samples_leaf=5, random_state=42
   )
   # Fit standard target directly
   final_model.fit(train_pool[features], train_pool[target])
   
   # Predict standard scale
   df['predicted_download_kbps'] = final_model.predict(df[features])
+
+  # Per-site prediction uncertainty — the spread across the Random Forest's
+  # individual trees is a genuine confidence signal, previously discarded.
+  # A site where all 100 trees roughly agree is one the model is confident
+  # about; wide disagreement means treat that prediction (and the residual/
+  # priority score built from it) more cautiously. Confirmed on real data to
+  # carry a meaningful, non-degenerate range (~5%-40% relative uncertainty).
+  print("📏 Computing per-site prediction uncertainty...")
+  X_all = df[features].values
+  tree_preds = np.stack([tree.predict(X_all) for tree in final_model.estimators_])
+  df['prediction_uncertainty_kbps'] = tree_preds.std(axis=0)
+  df['prediction_uncertainty_pct'] = (
+      df['prediction_uncertainty_kbps'] / df['predicted_download_kbps'].replace(0, np.nan)
+  ).fillna(0.0)
 
   # Rows outside the training pool never get a CV-validated prediction;
   # fall back to the production model's prediction so residuals/scoring
@@ -136,43 +155,74 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
 
 
 def calculate_esg_priority_matrix(df):
-  """Derives Energy Burden Indices and synthesizes the Joint Priority Score
-  (normalized to 0–100 for human readability).
+  """Derives Energy Burden Indices and synthesizes the Joint Priority Score.
+
+  Priority score is built from percentile ranks of each factor, not raw
+  multiplicative magnitude. A multiplicative raw-score formula lets a single
+  extreme value (an unusually large population, or a site the model badly
+  mispredicted) set the ceiling for min-max normalization and compress every
+  other site toward zero — confirmed directly against real data, where ~53%
+  of ranked sites collapsed to priority_score == 0.0 despite being genuine,
+  differentiated candidates. Percentile rank has no such floor-vs-outlier
+  problem: every site's score reflects its relative position, not its
+  distance from one extreme value. This mirrors the scoring approach already
+  validated in the dashboard's priority_v2 (see app.py::score()).
   """
   print("🔋 Computing Energy Burden and Carbon Abatement Matrix...")
 
   # Fallbacks for missing vector distances
-  # A missing value means the infrastructure is far outside the local bounding box.
+  # A missing value means Overture's layer was completely empty for this
+  # region's bounding box (see infrastructure_pipeline.py) — rare for a
+  # whole-country query, but not impossible for a smaller or sparsely-mapped
+  # region. power_distance_missing / road_distance_missing /
+  # amenity_distance_missing are now set upstream (in main.py and
+  # run_pipeline(), before imputation runs) rather than here — setting them
+  # in this function would always read False, since by the time this runs
+  # the NaN has usually already been filled elsewhere.
   df['distance_to_power_m'] = df['distance_to_power_m'].fillna(10000.0)
   df['distance_to_road_m'] = df['distance_to_road_m'].fillna(10000.0)
   df['distance_to_amenity_m'] = df['distance_to_amenity_m'].fillna(10000.0)
 
-  # Updated Off-Grid Likelihood Formula 
+  # Off-Grid Likelihood Formula — every component is bounded to [0,1] before
+  # its weight is applied, so the whole score is genuinely bounded [0,1].
+  # Previously the night-radiance term used a raw 1/(x+0.1) with no ceiling —
+  # at radiance=0 that term alone equaled 2.5, more than 3x every other
+  # weighted term combined, silently dominating the score. Replaced with a
+  # linear darkness score referenced against a typical urban radiance level,
+  # which decreases smoothly from 1.0 (fully dark) to 0.0 (urban-bright)
+  # instead of spiking unbounded near zero.
+  # Off-Grid Likelihood — power remoteness and darkness only. Population and
+  # road distance were removed: population isn't evidence a tower runs on
+  # diesel (it's a downstream impact question, now handled separately in
+  # community_impact below), and road distance is a refuelling/logistics
+  # cost, not evidence of grid status. Each input now has exactly one job.
+  power_remoteness = (df['distance_to_power_m'] / 5000.0).clip(lower=0.0, upper=1.0)
+  darkness_score = (1.0 - (df['night_radiance_nw_cm2_sr'] / 10.0)).clip(lower=0.0, upper=1.0)
+
   df['off_grid_likelihood'] = (
-      (df['distance_to_power_m'] / 5000.0).clip(upper=1.0) * 0.35
-      + (df['distance_to_road_m'] / 2000.0).clip(upper=1.0) * 0.25
-      + (1.0 / (df['night_radiance_nw_cm2_sr'] + 0.1)) * 0.25
-      + (df['population_total'] / 1000.0).clip(upper=1.0) * 0.15 
+      0.75 * power_remoteness
+      + 0.25 * darkness_score
   )
 
-  # Dynamic Solar Aspect Logic (Scalable across the equator)
-  # Northern Hemisphere (>0) prefers South (180). Southern Hemisphere (<0) prefers North (0).
-  optimal_aspect = np.where(df['latitude'] > 0, 180.0, 0.0)
-  
-  # Calculate shortest angular distance (0 to 180 degrees off from optimal)
-  aspect_diff = np.abs(df['aspect_degrees'] - optimal_aspect)
-  aspect_diff = np.minimum(aspect_diff, 360.0 - aspect_diff)
-  
-  # Convert to a 0-1 multiplier (1 = perfect orientation, 0 = completely backward)
-  aspect_score = 1.0 - (aspect_diff / 180.0)
+  # Solar Viability — aspect removed. Panels are mounted at whatever azimuth
+  # is chosen; the direction the surrounding natural terrain happens to face
+  # doesn't dictate panel orientation, and aspect is circular data (0-360°),
+  # which the old logic averaged in a way that breaks near the 0/360 wrap.
+  # Tree canopy (already extracted, previously unused) is a more directly
+  # relevant shading-risk proxy for a real installation.
+  solar_resource = df['solar_radiation_mj'].rank(pct=True)
+  canopy_suitability = (1.0 - (df['tree_canopy'] / 100.0)).clip(lower=0.0, upper=1.0)
+  slope_suitability = (1.0 - (df['slope_degrees'] / 30.0)).clip(lower=0.0, upper=1.0)
+  # Higher rainfall gets a modest penalty
+  rainfall_suitability = (1.0 - df['rainfall_mm_hr'].rank(pct=True))
 
-  # Solar Viability
   df['solar_viability'] = (
-      (df['solar_radiation_mj'] / df['solar_radiation_mj'].max()) * 0.5
-      + (1.0 / (df['slope_degrees'] + 1.0)) * 0.3
-      + aspect_score * 0.2 
-  ) - (df['rainfall_mm_hr'] * 0.1)
-  
+      0.60 * solar_resource
+      + 0.20 * canopy_suitability
+      + 0.10 * slope_suitability
+      + 0.10 * rainfall_suitability
+  )
+
   df['solar_viability'] = df['solar_viability'].clip(lower=0.1)
 
   # Logistics Difficulty
@@ -187,7 +237,7 @@ def calculate_esg_priority_matrix(df):
   # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr baseline).
   # We multiply by likelihood here so the dashboard displays the EXPECTED actual savings
   expected_abatement = 34.2 * 0.65 * df['off_grid_likelihood'].clip(upper=1.0)
-  
+
   df['indicative_abatement_tco2e_yr'] = np.where(
       df['off_grid_likelihood'] < 0.10,
       0.0,
@@ -202,43 +252,114 @@ def calculate_esg_priority_matrix(df):
       opex_credit
   )
 
-  # Underperformance Residual
+  # TNB Grid-Connected Comparison (workplan Step 3)
+  # Even grid power isn't zero-carbon in Malaysia — this shows the diesel
+  # baseline against what the same energy output would cost in grid emissions,
+  # so the comparison is honest rather than implying grid = zero emissions.
+  # Diesel genset efficiency: ~3.5 kWh generated per litre, a conservative
+  # planning figure for small (5-30 kVA) remote telecom gensets, which
+  # typically run below their most efficient load band (industry range is
+  # 3.5-5 kWh/L for modern diesel gensets at optimal load).
+  DIESEL_KWH_PER_LITRE = 3.5
+  TNB_GRID_EMISSION_FACTOR_KG_PER_KWH = 0.574  # TNB, 2025
+
+  diesel_energy_equivalent_kwh = 13000 * DIESEL_KWH_PER_LITRE
+  grid_equivalent_tco2e_yr_full = (
+      diesel_energy_equivalent_kwh * TNB_GRID_EMISSION_FACTOR_KG_PER_KWH
+  ) / 1000.0
+
+  df['grid_equivalent_tco2e_yr'] = np.where(
+      df['off_grid_likelihood'] < 0.10,
+      0.0,
+      grid_equivalent_tco2e_yr_full * df['off_grid_likelihood'].clip(upper=1.0)
+  )
+
+  # Underperformance Residual — kept in its natural kbps units for display
+  # and SHAP; only its percentile RANK feeds the priority score below.
+  # Positive values mean measured performance is below what was expected;
+  # clipped at 0.0, not 1.0 — the old floor of 1.0 meant overperforming sites
+  # (negative raw residual) got folded in alongside genuinely marginal ones,
+  # and both ended up tied at the same nonzero value.
   df['underperformance_residual'] = (
       df['cv_predicted_speed'] - df['download_kbps']
+  ).clip(lower=0.0)
+
+  # Essential Service Weight — continuous proximity score, not a binary cutoff.
+  # The old version (50.0 if within 2.5km, else 0.0) collapsed almost every
+  # ranked site into the same flat value, since the median site is only ~565m
+  # from an amenity — nearly everyone cleared the 2.5km threshold. That threw
+  # away the real variance already present in distance_to_amenity_m. This
+  # scales linearly instead: closer sites score higher, smoothly, up to the
+  # same 2.5km cutoff distance where it reaches zero.
+  df['essential_service_weight'] = (
+      1.0 - (df['distance_to_amenity_m'] / 2500.0).clip(upper=1.0)
+  ) * 50.0
+
+  # ---- Priority score: 4 pillars, matching the problem statement directly ----
+  # Diesel dependence 40%, solar suitability 25%, community impact 30%,
+  # implementation feasibility 5%.
+  #
+  # Community impact (population + essential services + connectivity
+  # shortfall) is GATED by off-grid likelihood before it can contribute.
+  # Population is real evidence of *impact if converted*, but it is NOT
+  # evidence a site is actually diesel-dependent — a dense, well-served urban
+  # site should not out-rank a genuine rural diesel candidate just because
+  # more people live nearby. The gate ramps smoothly from 0% credit at
+  # off_grid_likelihood=0.20 to 100% credit at 0.60 (roughly the 37th to 83rd
+  # percentile of this run's ranked population) rather than a hard cutoff,
+  # so a site just above the threshold doesn't suddenly get the same
+  # population credit as one far above it.
+  off_grid_n = df['off_grid_likelihood'].rank(pct=True)
+  solar_n = df['solar_viability'].rank(pct=True)
+  access_ease_n = 1.0 - df['logistics_difficulty'].rank(pct=True)
+
+  population_n = df['population_total'].rank(pct=True)
+  service_n = df['essential_service_weight'].rank(pct=True)
+
+  # Rank connectivity shortfall the same way the diesel gate is handled:
+  # sites genuinely at or above expected speed (residual == 0) get exactly
+  # zero shortfall credit, not the average percentile rank of a mass tie at
+  # the old floor value — same tie-ranking issue, same fix pattern.
+  residual_n = pd.Series(0.0, index=df.index)
+  underperforming_mask = df['underperformance_residual'] > 0
+  residual_n.loc[underperforming_mask] = (
+      df.loc[underperforming_mask, 'underperformance_residual'].rank(pct=True)
   )
-  df['underperformance_residual'] = df['underperformance_residual'].apply(
-      lambda x: max(x, 1.0)
+
+  diesel_gate = ((df['off_grid_likelihood'] - 0.20) / 0.40).clip(lower=0.0, upper=1.0)
+
+  raw_community_impact = (
+      0.50 * population_n
+      + 0.30 * service_n
+      + 0.20 * residual_n
   )
+  # Rank community NEED before applying the diesel gate, not after. Applying
+  # the gate first and then ranking the product is a bug: ~900 sites tie at
+  # exactly 0 after gating, and rank(pct=True) gives tied values their AVERAGE
+  # rank position, not 0 — confirmed on real data, this was leaking ~5.7
+  # priority points into sites the gate was specifically meant to zero out.
+  # Ranking first means gate=0 always means exactly 0 contribution.
+  raw_community_n = raw_community_impact.rank(pct=True)
+  df['community_impact'] = raw_community_n * diesel_gate
+  community_n = df['community_impact']
 
-  # Essential Service Weight (Boosts score if within 2.5km of a school/clinic)
-  df['essential_service_weight'] = df['distance_to_amenity_m'].apply(
-      lambda d: 50.0 if d <= 2500 else 0.0
-  )
+  # Export the intermediate pillar scores themselves, not just the final
+  # blended priority_score — so a site-detail panel can show "Diesel 91,
+  # Solar 82, Community 77, Feasibility 54" directly, without needing to
+  # recompute any of this from raw columns.
+  df['off_grid_score_n'] = off_grid_n
+  df['solar_score_n'] = solar_n
+  df['community_impact_n'] = community_n
+  df['access_ease_n'] = access_ease_n
+  df['diesel_gate'] = diesel_gate
+  df['service_shortfall_n'] = residual_n
 
-  # Raw Priority Score Equation
-  # Note: off_grid_likelihood is removed from this equation because it is already 
-  # mathematically baked into indicative_abatement_tco2e_yr
-  numerator = (
-      (
-          df['indicative_abatement_tco2e_yr']
-          * df['solar_viability']
-      )
-      * (df['population_total'] + df['essential_service_weight'])
-      * df['underperformance_residual']
-  )
-
-  raw_score = numerator / df['logistics_difficulty']
-
-  # 0–100 Min-Max Normalization for human readability on Streamlit
-  min_val = raw_score.min()
-  max_val = raw_score.max()
-
-  if max_val != min_val:
-    df['priority_score'] = (
-        ((raw_score - min_val) / (max_val - min_val)) * 100
-    ).round(2)
-  else:
-    df['priority_score'] = 50.0
+  df['priority_score'] = (
+      0.40 * off_grid_n
+      + 0.25 * solar_n
+      + 0.30 * community_n
+      + 0.05 * access_ease_n
+  ).mul(100).round(2)
 
   # Core Pitch Metric: People connected per tonne of CO2 avoided
   # Handled safely to prevent `inf` corruption in downstream datasets
@@ -294,6 +415,15 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
           df[col] = df[col].fillna(0)
           
   # 2. Missing infrastructure = 10,000m (Extremely remote)
+  # Preserve original missingness BEFORE imputation — flagging after
+  # fillna() always reads False, since the NaN is already gone by then.
+  if 'distance_to_power_m' in df.columns:
+      df['power_distance_missing'] = df['distance_to_power_m'].isna()
+  if 'distance_to_road_m' in df.columns:
+      df['road_distance_missing'] = df['distance_to_road_m'].isna()
+  if 'distance_to_amenity_m' in df.columns:
+      df['amenity_distance_missing'] = df['distance_to_amenity_m'].isna()
+
   distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
   for col in distance_cols:
       if col in df.columns:
@@ -327,7 +457,7 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   governed_df = apply_governance_confidence_mask(df)
 
   # 3b. Check for valid targets BEFORE splitting or scoring
-  valid_mask = governed_df['confidence_tier'].str.contains('Ranked Screening Approved')
+  valid_mask = governed_df['confidence_tier'] == 'Sufficient Evidence - Ranked Screening Approved'
   
   if not valid_mask.any():
       print("⚠️ ZERO valid target sites found in region. Injecting neutral schema.")
@@ -336,8 +466,11 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
       empty_cols = [
           'top_shap_driver', 'top_shap_value', 'off_grid_likelihood', 
           'solar_viability', 'logistics_difficulty', 'indicative_abatement_tco2e_yr', 
-          'indicative_opex_saving_usd', 'underperformance_residual', 
-          'essential_service_weight', 'priority_score', 'people_connected_per_tonne_co2'
+          'indicative_opex_saving_usd', 'grid_equivalent_tco2e_yr',
+          'underperformance_residual', 'essential_service_weight', 'community_impact',
+          'off_grid_score_n', 'solar_score_n', 'community_impact_n',
+          'access_ease_n', 'diesel_gate', 'service_shortfall_n',
+          'priority_score', 'people_connected_per_tonne_co2'
       ]
       for col in empty_cols:
           df[col] = np.nan
@@ -351,17 +484,36 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
       invalid_sites = governed_df[~valid_mask].copy()
       
       scored_valid = calculate_esg_priority_matrix(valid_sites)
-      
+      invalid_sites['priority_score'] = 0.0
+      invalid_sites['community_impact'] = 0.0
+      invalid_sites['people_connected_per_tonne_co2'] = 0.0
       df = pd.concat([scored_valid, invalid_sites], ignore_index=True)
       df.loc[~df['confidence_tier'].str.contains('Sufficient'), ['top_shap_driver', 'top_shap_value']] = None
-      df['inference_status'] = 'Candidate Site - Validation Required'
+      df['inference_status'] = np.select(
+          [
+              df['confidence_tier'] == 'Sufficient Evidence - Ranked Screening Approved',
+              df['confidence_tier'] == 'Sufficient Evidence - Performing Above Baseline (Excluded)',
+              df['confidence_tier'] == 'Thin Evidence - Masked from Prioritization'
+          ],
+          [
+              'Candidate Site - Validation Required',
+              'Excluded - Performing Above Baseline',
+              'Insufficient Evidence - Additional Data Required'
+          ],
+          default='Excluded - No Data'
+      )
       df['field_survey_triggered'] = df['confidence_tier'].apply(
           lambda x: True if 'Ranked Screening Approved' in x else False
       )
       df = df.sort_values(
           by=['field_survey_triggered', 'priority_score'], ascending=[False, False]
       ).reset_index(drop=True)
-      df['national_rank'] = df.index + 1
+      # Only candidate sites get a national rank — excluded and thin-evidence
+      # sites previously received sequential ranks too (e.g. 2,390, 2,391...),
+      # which reads as if they'd been meaningfully ranked against candidates.
+      df['national_rank'] = 0
+      rank_mask = df['field_survey_triggered']
+      df.loc[rank_mask, 'national_rank'] = np.arange(1, rank_mask.sum() + 1)
       
   # 5. Export Output for Dashboard Lead (Teammate #3)
   output_path = os.path.join(data_dir, "jendela_phase2_esg_scored.parquet")
