@@ -49,7 +49,7 @@ pip install --upgrade pip
 Our stack relies heavily on compiled C-libraries for fast spatial queries. Install the pinned dependencies:
 
 ```bash
-pip install pandas geopandas duckdb shapely earthengine-api lightgbm shap scikit-learn pyarrow mapclassify folium streamlit
+pip install pandas geopandas duckdb shapely earthengine-api shap scikit-learn pyarrow mapclassify folium streamlit
 
 ```
 
@@ -98,4 +98,4 @@ You do NOT need to run `main.py`. Simply download the pre-computed national feat
 
 ## 🤖 AI Transparency Declaration
 
-Team One-third-Nine-to-five acknowledges the use of Gemini 3.1 Pro and Claude 5 Sonnet to assist with project brainstorming, code generation, debugging, and presentation design.
+Team One-third-Nine-to-five acknowledges the use of Gemini 3.1 Pro, Claude 5 Sonnet and GPT 5.6 Sol to assist with project brainstorming, code generation, debugging, and presentation design.

@@ -14,10 +14,23 @@ GEOJSON_PATH = os.path.join(DATA_DIR, "Asean.geojson")
 OPENCELLID_PATH = os.path.join(DATA_DIR, "cell_towers.csv.gz")
 OUTPUT_FILE_PATH = os.path.join(DATA_DIR, "jendela_phase2_esg_matrix.parquet")
 
+#--------------------------------
+
 GEE_DRIVE_FOLDER = 'ESG_Hackathon'
 
-# Tuple of all ASEAN Mobile Country Codes
-ASEAN_MCCS = (414, 452, 456, 457, 502, 510, 515, 520, 525, 528)
+# Strict MCC mapping to prevent cross-border data leakage
+ASEAN_MCC_BY_REGION = {
+    "Myanmar": 414,
+    "Vietnam": 452,
+    "Cambodia": 456,
+    "Laos DR": 457,
+    "Malaysia": 502,
+    "Indonesia": 510,
+    "Philippines": 515,
+    "Thailand": 520,
+    "Singapore": 525,
+    "Brunei Darussalam": 528,
+}
 
 ASEAN_BOUNDS = {
     "Malaysia": [99.6, 0.8, 119.3, 7.5],
@@ -52,8 +65,7 @@ MODEL_FEATURES = [
     'antennas_3G',         # Changed from radio_UMTS
     'antennas_2G',         # Changed from radio_GSM
     'antennas_5G',         # Changed from radio_NR
-    'tree_canopy',
-    'distance_to_tier1_hub_m'
+    'tree_canopy'
 ]
 OOKLA_DATA_URL = 'https://ookla-open-data.s3.us-west-2.amazonaws.com/parquet/performance/type=mobile/year=2023/quarter=4/2023-10-01_performance_mobile_tiles.parquet'
 

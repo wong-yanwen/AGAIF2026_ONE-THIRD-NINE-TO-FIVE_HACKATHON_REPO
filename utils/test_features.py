@@ -1,6 +1,6 @@
 import pandas as pd
 
-file_path="data/jendela_phase2_esg_matrix_malaysia.parquet"
+file_path="data/jendela_phase2_esg_matrix_MALAYSIA.parquet"
 
 print(f"📥 Inspecting: {file_path}\n")
 df = pd.read_parquet(file_path)

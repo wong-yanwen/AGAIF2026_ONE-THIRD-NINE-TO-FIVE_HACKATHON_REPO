@@ -10,7 +10,7 @@ from data_pipeline.ookla_pipeline import get_underserved_sites, apply_stratified
 from data_pipeline.gee_pipeline import extract_gee_data, clean_and_merge
 from data_pipeline.vector_pipeline import process_vector_proximity
 from data_pipeline.infrastructure_pipeline import process_candidate_site_clusters, engineering_osm_proximity_features
-from data_pipeline.config import OPENCELLID_PATH, OUTPUT_FILE_PATH, ASEAN_MCCS, ASEAN_BOUNDS, DATA_DIR, MODEL_FEATURES
+from data_pipeline.config import OPENCELLID_PATH, OUTPUT_FILE_PATH, ASEAN_BOUNDS, DATA_DIR, MODEL_FEATURES, ASEAN_MCC_BY_REGION
 from models.model_pipeline import apply_spatial_blocking_cv, calculate_esg_priority_matrix, apply_governance_confidence_mask
 
 def main(region_name="Malaysia"):
@@ -36,14 +36,16 @@ def main(region_name="Malaysia"):
     print(f"🏗️ Loading raw antenna data from {OPENCELLID_PATH}...")
     df_raw_cell_global = pd.read_csv(OPENCELLID_PATH, compression='gzip')
     df_raw_cell_global = df_raw_cell_global.rename(columns={'lon': 'longitude', 'lat': 'latitude'})
+
+    # MEMORY & LEAKAGE FIX: Strictly bound the dataset by exact Country MCC, not all ASEAN
+    region_mcc = ASEAN_MCC_BY_REGION[region]
     
-    # MEMORY FIX: Strictly bound the dataset before passing to DBSCAN
     df_raw_cell = df_raw_cell_global[
-        (df_raw_cell_global['mcc'].isin(ASEAN_MCCS)) &
+        (df_raw_cell_global['mcc'] == region_mcc) &
         (df_raw_cell_global['longitude'] >= bounds[0]) & (df_raw_cell_global['longitude'] <= bounds[2]) &
         (df_raw_cell_global['latitude'] >= bounds[1]) & (df_raw_cell_global['latitude'] <= bounds[3])
     ].copy()
-    print(f"✅ Extracted {len(df_raw_cell)} antenna nodes within {region} boundaries.")
+    print(f"✅ Extracted {len(df_raw_cell)} {region} antenna nodes (MCC {region_mcc}).")
     
     site_nodes = process_candidate_site_clusters(df_raw_cell)
 
@@ -53,7 +55,6 @@ def main(region_name="Malaysia"):
     #site_nodes_final['distance_to_power_m'] = 1500.0  # Fake distance to power lines
     #site_nodes_final['distance_to_road_m'] = 300.0    # Fake distance to roads
     #site_nodes_final['distance_to_amenity_m'] = 4500.0 # Fake distance to schools/clinics
-    #site_nodes_final['distance_to_tier1_hub_m'] = 25000.0 # Fake distance to Tier 1 hub
     # --------------------------------------------------------------------------------------
     
     # ACTUAL 
@@ -97,7 +98,7 @@ def main(region_name="Malaysia"):
         if 'distance_to_amenity_m' in master_matrix.columns:
             master_matrix['amenity_distance_missing'] = master_matrix['distance_to_amenity_m'].isna()
 
-        distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
+        distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
         for col in distance_cols:
             if col in master_matrix.columns:
                 master_matrix[col] = master_matrix[col].fillna(10000.0)
@@ -108,10 +109,13 @@ def main(region_name="Malaysia"):
             if col in master_matrix.columns:
                 master_matrix[col] = master_matrix[col].fillna(master_matrix[col].median())
 
-        # 4. Now calculate engineered features safely directly on the clean DataFrame
-        master_matrix['congestion_proxy'] = master_matrix['population_total'].fillna(0) / (master_matrix['antenna_count'] + 1)
+        # 4. Handle population explicitly (NaN in WorldPop means zero/ocean/unpopulated)
+        master_matrix['population_total'] = master_matrix['population_total'].fillna(0)
+
+        # 5. Now calculate engineered features safely directly on the clean DataFrame
+        master_matrix['congestion_proxy'] = master_matrix['population_total'] / (master_matrix['antenna_count'] + 1)
         master_matrix['pct_4g_5g'] = (master_matrix['antennas_4G'] + master_matrix['antennas_5G']) / (master_matrix['antenna_count'] + 1)
-        
+
         missing_features = [f for f in MODEL_FEATURES if f not in master_matrix.columns]
         if missing_features:
             print(f"⚠️ Missing model features for this region: {missing_features}")
@@ -142,7 +146,9 @@ def main(region_name="Malaysia"):
                 'essential_service_weight', 'community_impact',
                 'off_grid_score_n', 'solar_score_n', 'community_impact_n',
                 'access_ease_n', 'diesel_gate', 'service_shortfall_n',
-                'priority_score', 'people_connected_per_tonne_co2'
+                'prediction_uncertainty_kbps', 'prediction_uncertainty_pct',
+                'priority_score', 'people_connected_per_tonne_co2',
+                'power_distance_missing', 'road_distance_missing', 'amenity_distance_missing'
             ]
             for col in expected_cols:
                 final_matrix[col] = np.nan
@@ -156,7 +162,7 @@ def main(region_name="Malaysia"):
             valid_sites = governed_matrix[valid_mask].copy()
             invalid_sites = governed_matrix[~valid_mask].copy()
             
-            scored_valid = calculate_esg_priority_matrix(valid_sites)
+            scored_valid = calculate_esg_priority_matrix(valid_sites, region=region)
             invalid_sites['priority_score'] = 0.0
             invalid_sites['community_impact'] = 0.0
             invalid_sites['people_connected_per_tonne_co2'] = 0.0

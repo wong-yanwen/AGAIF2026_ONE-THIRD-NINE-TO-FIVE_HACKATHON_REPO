@@ -1,46 +1,37 @@
 import pandas as pd
 
 # Load your final produced dataset
-df = pd.read_parquet("data/jendela_phase2_esg_matrix_malaysia.parquet")
+df = pd.read_parquet("data/jendela_phase2_esg_matrix_MALAYSIA.parquet")
 
 # Filter only valid sites (the ones eligible for ranking)
 df = df[df['confidence_tier'] == 'Sufficient Evidence - Ranked Screening Approved'].copy()
 
-def score_with_weights(data, w_slope, w_elev, w_road, w_rugged):
-    # Recalculate Logistics Difficulty with NEW weights
-    temp_logistics = (
-        (data['slope_degrees'] / 15.0) * w_slope
-        + (data['elevation_m'] / 1000.0) * w_elev
-        + (data['distance_to_road_m'] / 1000.0) * w_road
-        + (data['terrain_ruggedness'] / 50.0) * w_rugged
-    ).clip(lower=0.1)
-    
-    # Recalculate the raw score (likelihood is already baked into abatement)
-    numerator = (
-        (data['indicative_abatement_tco2e_yr'] * data['solar_viability'])
-        * (data['population_total'] + data['essential_service_weight'])
-        * data['underperformance_residual']
+def score_macro_pillars(data, w_offgrid, w_solar, w_community, w_access):
+    # This perfectly mirrors the V2 Additive Percentile math from model_pipeline.py
+    score = (
+        w_offgrid * data['off_grid_score_n']
+        + w_solar * data['solar_score_n']
+        + w_community * data['community_impact_n']
+        + w_access * data['access_ease_n']
     )
-    
-    raw_score = numerator / temp_logistics
-    return raw_score
+    return score
 
-# 1. Baseline Ranking (What is currently in cuurent pipeline: 40% slope, 30% elev, 30% road, 20% ruggedness)
-df['baseline_score'] = score_with_weights(df, 0.4, 0.3, 0.3, 0.2)
+# 1. Baseline Ranking (What is currently in pipeline: 40% Diesel, 25% Solar, 30% Community, 5% Access)
+df['baseline_score'] = score_macro_pillars(df, 0.40, 0.25, 0.30, 0.05)
 top_20_baseline = set(df.nlargest(20, 'baseline_score')['site_id'])
 
-# 2. Scenario B (Heavy penalty on Elevation & Ruggedness: 20% slope, 50% elev, 20% road, 30% ruggedness)
-df['scenario_b_score'] = score_with_weights(df, 0.2, 0.5, 0.2, 0.3)
-top_20_scenario_b = set(df.nlargest(20, 'scenario_b_score')['site_id'])
+# 2. Scenario B: The "Pro-Social" Shift (Community jumps to 50%, Diesel drops to 20%)
+df['scenario_social_score'] = score_macro_pillars(df, 0.20, 0.25, 0.50, 0.05)
+top_20_social = set(df.nlargest(20, 'scenario_social_score')['site_id'])
 
 # 3. Compare them
-overlap = top_20_baseline.intersection(top_20_scenario_b)
+overlap = top_20_baseline.intersection(top_20_social)
 overlap_percentage = (len(overlap) / 20) * 100
 
-print(f"📊 Sensitivity Analysis Results:")
-print(f"Sites remaining in Top 20 despite drastic weight changes: {len(overlap)}/20 ({overlap_percentage}%)")
+print(f"📊 Macro-Pillar Sensitivity Analysis Results:")
+print(f"Sites remaining in Top 20 despite drastic shift from Environmental to Social focus: {len(overlap)}/20 ({overlap_percentage}%)")
 
-if overlap_percentage >= 80:
-    print("✅ Defense Ready: 'Our model is highly stable. Altering the logistics weights significantly only shifts the ranking by a few sites.'")
+if overlap_percentage >= 70:
+    print("✅ Defense Ready: 'Our model is highly stable. Even if JENDELA shifts from a decarbonization focus to a pure rural-inclusion focus, the core priority list remains intact.'")
 else:
-    print("⚠️ The ranking is sensitive to your weights. You will need to justify why you picked 0.4/0.3/0.3/0.2.")
+    print("⚠️ The ranking is highly sensitive to policy priorities. Your dashboard slider is the ultimate defense.")

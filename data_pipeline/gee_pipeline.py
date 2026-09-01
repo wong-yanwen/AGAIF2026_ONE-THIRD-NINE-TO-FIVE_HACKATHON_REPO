@@ -24,9 +24,6 @@ def build_esg_composite():
     elevation = nasadem.select('elevation').rename('elevation')
     slope = ee.Terrain.slope(elevation).rename('slope')
 
-    # Extract terrain aspect (compass direction for solar panel viability)
-    aspect = ee.Terrain.aspect(elevation).rename('aspect')
-
     # Terrain Ruggedness Index via local elevation standard deviation (3x3 pixel window)
     ruggedness = elevation.reduceNeighborhood(
         reducer=ee.Reducer.stdDev(),
@@ -38,7 +35,7 @@ def build_esg_composite():
     # NEW: Extract 2000-era baseline tree canopy percentage (0-100)
     tree_canopy = ee.Image('UMD/hansen/global_forest_change_2025_v1_13').select('treecover2000').rename('tree_canopy')
 
-    return ee.Image.cat([viirs, era5, worldpop, elevation, slope, aspect, ruggedness, rainfall, tree_canopy])
+    return ee.Image.cat([viirs, era5, worldpop, elevation, slope, ruggedness, rainfall, tree_canopy])
 
 def extract_gee_data(df_sites, country_name):
     init_gee()
@@ -177,7 +174,6 @@ def clean_and_merge(df_ookla, df_env):
     master_df = master_df.rename(columns={
         'elevation_mean': 'elevation_m',
         'slope_mean': 'slope_degrees',
-        'aspect_mean': 'aspect_degrees',
         'terrain_ruggedness_mean': 'terrain_ruggedness',
         'rainfall_mean': 'rainfall_mm_hr',
         'night_radiance_mean': 'night_radiance_nw_cm2_sr', 
@@ -191,7 +187,7 @@ def clean_and_merge(df_ookla, df_env):
         
     columns_to_drop = [
         'elevation_sum', 'population_mean', 'night_radiance_sum', 
-        'rainfall_sum', 'slope_sum', 'aspect_sum',
+        'rainfall_sum', 'slope_sum', 
         'solar_radiation_sum', 'solar_radiation_raw', 'terrain_ruggedness_sum',
         'tree_canopy_sum'
     ]

@@ -34,9 +34,20 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   # (The 'is_underserved_target' flag already checks for tests >= 15 and devices >= 5)
   target_mask = df['is_underserved_target'] == True
   train_pool = df[target_mask].copy()
+  # random_state=42 guarantees reproducibility for a FIXED row order, not
+  # order-independence — RandomForest bootstrap sampling selects rows by
+  # position, so the same seed on the same data in a different row order can
+  # pull different actual rows into each tree. main.py trains on ETL order
+  # then sorts before export; standalone model_pipeline.py reloads that
+  # sorted parquet — different order, same data. Confirmed on real runs:
+  # Malaysia matched exactly (both orders happened to coincide), Indonesia
+  # and Philippines drifted by ~0.003-0.005 R² between entry points. Sorting
+  # by a stable, unique key before training makes both entry points
+  # deterministic against each other, not just against themselves.
+  train_pool = train_pool.sort_values("site_id", kind="mergesort").copy()
   print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
 
-  # --- NEW: SAFE BYPASS FOR SMALL/WEALTHY REGIONS ---
+  # --- SAFE BYPASS FOR SMALL/WEALTHY REGIONS ---
   if len(train_pool) < 10:
     print(f"⚠️ Insufficient training data ({len(train_pool)} target tiles). Bypassing ML model.")
     # Default predictions to actuals so residual becomes 0
@@ -44,6 +55,11 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
     df['predicted_download_kbps'] = df['download_kbps']
     df['top_shap_driver'] = 'Insufficient Data'
     df['top_shap_value'] = 0.0
+    # This branch returns before the model exists to compute tree-variance
+    # uncertainty from — placeholder so downstream code never hits a
+    # missing-column error on a region too small to train on.
+    df['prediction_uncertainty_kbps'] = np.nan
+    df['prediction_uncertainty_pct'] = np.nan
     return df
   # --------------------------------------------------
 
@@ -122,13 +138,17 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   # Predict standard scale
   df['predicted_download_kbps'] = final_model.predict(df[features])
 
-  # Per-site prediction uncertainty — the spread across the Random Forest's
-  # individual trees is a genuine confidence signal, previously discarded.
-  # A site where all 100 trees roughly agree is one the model is confident
-  # about; wide disagreement means treat that prediction (and the residual/
-  # priority score built from it) more cautiously. Confirmed on real data to
-  # carry a meaningful, non-degenerate range (~5%-40% relative uncertainty).
-  print("📏 Computing per-site prediction uncertainty...")
+  # Per-site model disagreement — the spread across the Random Forest's 100
+  # individual trees' predictions for the same input. This is NOT a
+  # calibrated confidence interval (no coverage guarantee has been validated
+  # — e.g. "the true value falls within this range X% of the time"); it is
+  # raw tree-to-tree disagreement. A site where all 100 trees roughly agree
+  # is one the model predicts stably; wide disagreement means treat that
+  # prediction (and the residual/priority score built from it) more
+  # cautiously. Confirmed on real data to carry a meaningful, non-degenerate
+  # range (~5%-40% relative disagreement). Describe as "model disagreement:
+  # variation across Random Forest trees" in the UI/pitch, not "confidence."
+  print("📏 Computing per-site model disagreement (tree-to-tree variance)...")
   X_all = df[features].values
   tree_preds = np.stack([tree.predict(X_all) for tree in final_model.estimators_])
   df['prediction_uncertainty_kbps'] = tree_preds.std(axis=0)
@@ -154,7 +174,7 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
   return df
 
 
-def calculate_esg_priority_matrix(df):
+def calculate_esg_priority_matrix(df, region=None):
   """Derives Energy Burden Indices and synthesizes the Joint Priority Score.
 
   Priority score is built from percentile ranks of each factor, not raw
@@ -169,19 +189,6 @@ def calculate_esg_priority_matrix(df):
   validated in the dashboard's priority_v2 (see app.py::score()).
   """
   print("🔋 Computing Energy Burden and Carbon Abatement Matrix...")
-
-  # Fallbacks for missing vector distances
-  # A missing value means Overture's layer was completely empty for this
-  # region's bounding box (see infrastructure_pipeline.py) — rare for a
-  # whole-country query, but not impossible for a smaller or sparsely-mapped
-  # region. power_distance_missing / road_distance_missing /
-  # amenity_distance_missing are now set upstream (in main.py and
-  # run_pipeline(), before imputation runs) rather than here — setting them
-  # in this function would always read False, since by the time this runs
-  # the NaN has usually already been filled elsewhere.
-  df['distance_to_power_m'] = df['distance_to_power_m'].fillna(10000.0)
-  df['distance_to_road_m'] = df['distance_to_road_m'].fillna(10000.0)
-  df['distance_to_amenity_m'] = df['distance_to_amenity_m'].fillna(10000.0)
 
   # Off-Grid Likelihood Formula — every component is bounded to [0,1] before
   # its weight is applied, so the whole score is genuinely bounded [0,1].
@@ -230,7 +237,7 @@ def calculate_esg_priority_matrix(df):
       (df['slope_degrees'] / 15.0) * 0.4
       + (df['elevation_m'] / 1000.0) * 0.3
       + (df['distance_to_road_m'] / 1000.0) * 0.3
-      + (df['terrain_ruggedness'] / 50.0) * 0.2  # NEW: Penalize highly rugged terrain
+      + (df['terrain_ruggedness'] / 50.0) * 0.2  # Penalize highly rugged terrain
   ).clip(lower=0.1)
 
   # CO2 Threshold Gate
@@ -260,19 +267,30 @@ def calculate_esg_priority_matrix(df):
   # planning figure for small (5-30 kVA) remote telecom gensets, which
   # typically run below their most efficient load band (industry range is
   # 3.5-5 kWh/L for modern diesel gensets at optimal load).
-  DIESEL_KWH_PER_LITRE = 3.5
-  TNB_GRID_EMISSION_FACTOR_KG_PER_KWH = 0.574  # TNB, 2025
+  #
+  # TNB is Malaysia's national utility — its 0.574 kg CO2e/kWh emission
+  # factor is Malaysia-specific and does not represent Indonesia's or the
+  # Philippines' grid mix. Gated to Malaysia only; NaN elsewhere until each
+  # country's own grid emission factor is added. This does not feed
+  # priority_score or any of the four pillars — it's a display-only
+  # comparison metric, so this gap doesn't affect rankings, only what's
+  # shown for this one number outside Malaysia.
+  if region is not None and region.lower() == "malaysia":
+    DIESEL_KWH_PER_LITRE = 3.5
+    TNB_GRID_EMISSION_FACTOR_KG_PER_KWH = 0.574  # TNB, 2025
 
-  diesel_energy_equivalent_kwh = 13000 * DIESEL_KWH_PER_LITRE
-  grid_equivalent_tco2e_yr_full = (
-      diesel_energy_equivalent_kwh * TNB_GRID_EMISSION_FACTOR_KG_PER_KWH
-  ) / 1000.0
+    diesel_energy_equivalent_kwh = 13000 * DIESEL_KWH_PER_LITRE
+    grid_equivalent_tco2e_yr_full = (
+        diesel_energy_equivalent_kwh * TNB_GRID_EMISSION_FACTOR_KG_PER_KWH
+    ) / 1000.0
 
-  df['grid_equivalent_tco2e_yr'] = np.where(
-      df['off_grid_likelihood'] < 0.10,
-      0.0,
-      grid_equivalent_tco2e_yr_full * df['off_grid_likelihood'].clip(upper=1.0)
-  )
+    df['grid_equivalent_tco2e_yr'] = np.where(
+        df['off_grid_likelihood'] < 0.10,
+        0.0,
+        grid_equivalent_tco2e_yr_full * df['off_grid_likelihood'].clip(upper=1.0)
+    )
+  else:
+    df['grid_equivalent_tco2e_yr'] = np.nan
 
   # Underperformance Residual — kept in its natural kbps units for display
   # and SHAP; only its percentile RANK feeds the priority score below.
@@ -315,6 +333,15 @@ def calculate_esg_priority_matrix(df):
 
   population_n = df['population_total'].rank(pct=True)
   service_n = df['essential_service_weight'].rank(pct=True)
+  # distance_to_tier1_hub_m was briefly added here as a rurality signal, then
+  # reverted: the query behind it (infrastructure_pipeline.py) filters only
+  # on Overture's `subtype = 'locality'`, with no `class` or `population`
+  # filter — meaning it measures distance to ANY populated place, from
+  # megacities down to tiny hamlets, not distance to a genuinely major hub.
+  # A remote village is itself a "locality," so its own distance could read
+  # near zero — the opposite of what a rurality signal should show. Left
+  # unused until the underlying query is redefined with an actual size/class
+  # filter and renamed to something honest like distance_to_major_settlement_m.
 
   # Rank connectivity shortfall the same way the diesel gate is handled:
   # sites genuinely at or above expected speed (residual == 0) get exactly
@@ -395,7 +422,8 @@ def apply_governance_confidence_mask(df):
 def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   # 1. Resolve input file: explicit path > region-based default > error
   if input_file is None:
-    input_file = os.path.join(data_dir, f"jendela_phase2_esg_matrix_{region}.parquet")
+    region_slug = region.lower().replace(" ", "_")
+    input_file = os.path.join(data_dir, f"jendela_phase2_esg_matrix_{region_slug}.parquet")
 
   if not os.path.exists(input_file):
     print(f"❌ Input file not found: {input_file}")
@@ -408,35 +436,38 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
   # ==========================================================
   # DATA INTEGRITY: Domain-Aware Imputation
   # ==========================================================
-  # 1. Missing antennas = 0 (Do not use median for missing towers)
+  # A. Missing antennas = 0 (Do not use median for missing towers)
   antenna_cols = ['antenna_count', 'antennas_4G', 'antennas_3G', 'antennas_2G', 'antennas_5G']
   for col in antenna_cols:
       if col in df.columns:
           df[col] = df[col].fillna(0)
           
-  # 2. Missing infrastructure = 10,000m (Extremely remote)
-  # Preserve original missingness BEFORE imputation — flagging after
-  # fillna() always reads False, since the NaN is already gone by then.
-  if 'distance_to_power_m' in df.columns:
+  # B. Missing infrastructure
+  # Preserve missingness flags already created by main.py.
+  # Only generate them if the input file does not already contain them.
+  if 'power_distance_missing' not in df.columns:
       df['power_distance_missing'] = df['distance_to_power_m'].isna()
-  if 'distance_to_road_m' in df.columns:
+  if 'road_distance_missing' not in df.columns:
       df['road_distance_missing'] = df['distance_to_road_m'].isna()
-  if 'distance_to_amenity_m' in df.columns:
+  if 'amenity_distance_missing' not in df.columns:
       df['amenity_distance_missing'] = df['distance_to_amenity_m'].isna()
 
-  distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower','distance_to_tier1_hub_m']
+  distance_cols = ['distance_to_power_m', 'distance_to_road_m', 'distance_to_amenity_m', 'distance_to_nearest_tower']
   for col in distance_cols:
       if col in df.columns:
           df[col] = df[col].fillna(10000.0)
 
-  # 3. Missing natural geography (safe to use median)
+  # C. Missing natural geography (safe to use median)
   geo_cols = ['elevation_m', 'slope_degrees', 'terrain_ruggedness', 'night_radiance_nw_cm2_sr', 'solar_radiation_mj', 'rainfall_mm_hr', 'tree_canopy']
   for col in geo_cols:
       if col in df.columns:
           df[col] = df[col].fillna(df[col].median())
 
-  # 4. Now calculate engineered features safely directly on the clean DataFrame
-  df['congestion_proxy'] = df['population_total'].fillna(0) / (df['antenna_count'] + 1)
+  # D. Handle population explicitly (NaN in WorldPop means zero/ocean/unpopulated)
+  df['population_total'] = df['population_total'].fillna(0)
+
+  # E. Now calculate engineered features safely directly on the clean DataFrame
+  df['congestion_proxy'] = df['population_total'] / (df['antenna_count'] + 1)
   df['pct_4g_5g'] = (df['antennas_4G'] + df['antennas_5G']) / (df['antenna_count'] + 1)
 
 # 2. Define Features & Target
@@ -470,7 +501,9 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
           'underperformance_residual', 'essential_service_weight', 'community_impact',
           'off_grid_score_n', 'solar_score_n', 'community_impact_n',
           'access_ease_n', 'diesel_gate', 'service_shortfall_n',
-          'priority_score', 'people_connected_per_tonne_co2'
+          'prediction_uncertainty_kbps', 'prediction_uncertainty_pct',
+          'priority_score', 'people_connected_per_tonne_co2',
+          'power_distance_missing', 'road_distance_missing', 'amenity_distance_missing'
       ]
       for col in empty_cols:
           df[col] = np.nan
@@ -483,7 +516,7 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
       valid_sites = governed_df[valid_mask].copy()
       invalid_sites = governed_df[~valid_mask].copy()
       
-      scored_valid = calculate_esg_priority_matrix(valid_sites)
+      scored_valid = calculate_esg_priority_matrix(valid_sites, region=region)
       invalid_sites['priority_score'] = 0.0
       invalid_sites['community_impact'] = 0.0
       invalid_sites['people_connected_per_tonne_co2'] = 0.0
