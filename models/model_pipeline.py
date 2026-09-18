@@ -8,78 +8,74 @@ from sklearn.model_selection import KFold
 from data_pipeline.config import MODEL_FEATURES
 
 def apply_spatial_blocking_cv(df, features, target, n_splits=5):
-  """Executes Spatially Blocked Cross-Validation to eliminate spatial autocorrelation data leakage.
+  """Executes spatially blocked CV and records whether the ML residual is usable.
 
-  Trains and validates only on tiles meeting the Ookla evidence threshold —
-  Thin/No-Data tiles have too few tests to serve as reliable training labels.
-  Every row in df still receives a prediction; only the fitting/scoring pool
-  is restricted.
+  The Random Forest is trained/validated only on verified underserved target
+  tiles. The final production model may still be fitted for diagnostics and
+  SHAP, but the connectivity residual is allowed to influence ESG scoring only
+  when spatial validation succeeds with R² > 0.
   """
   print("🎯 Initializing Spatially Blocked Cross-Validation...")
 
-  # Generate 0.5-degree spatial blocks first, on the full dataframe,
-  # so these columns survive into the exported output.
-  # np.floor(), not .astype(int) directly — Python's int() truncates TOWARD
-  # ZERO, not toward negative infinity, so +0.2° and -0.2° both truncate to
-  # block 0, incorrectly merging locations on opposite sides of the equator
-  # into the same spatial block. Doesn't materially affect Malaysia (mostly
-  # north of the equator), but matters for scaling to Indonesia.
+  # Generate 0.5-degree spatial blocks first, on the full dataframe, so these
+  # columns survive into the exported output. np.floor() is important for
+  # countries crossing the equator because int() truncates toward zero.
   df['lat_block'] = np.floor(df['latitude'] / 0.5).astype(int)
   df['lon_block'] = np.floor(df['longitude'] / 0.5).astype(int)
   df['spatial_block'] = (
       df['lat_block'].astype(str) + "_" + df['lon_block'].astype(str)
   )
 
-  # Only fit/validate on explicitly flagged underserved target tiles.
-  # (The 'is_underserved_target' flag already checks for tests >= 15 and devices >= 5)
+  # Explicit model-governance fields. These are exported so the dashboard does
+  # not have to infer a bypass from suspiciously perfect predictions.
+  df['model_validation_status'] = 'Pending'
+  df['model_residual_enabled'] = False
+  df['spatial_cv_r2'] = np.nan
+
   target_mask = df['is_underserved_target'] == True
   train_pool = df[target_mask].copy()
-  # random_state=42 guarantees reproducibility for a FIXED row order, not
-  # order-independence — RandomForest bootstrap sampling selects rows by
-  # position, so the same seed on the same data in a different row order can
-  # pull different actual rows into each tree. main.py trains on ETL order
-  # then sorts before export; standalone model_pipeline.py reloads that
-  # sorted parquet — different order, same data. Confirmed on real runs:
-  # Malaysia matched exactly (both orders happened to coincide), Indonesia
-  # and Philippines drifted by ~0.003-0.005 R² between entry points. Sorting
-  # by a stable, unique key before training makes both entry points
-  # deterministic against each other, not just against themselves.
-  train_pool = train_pool.sort_values("site_id", kind="mergesort").copy()
-  print(f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold.")
 
-  # --- SAFE BYPASS FOR SMALL/WEALTHY REGIONS ---
+  # Make both main.py and standalone model_pipeline.py deterministic even if
+  # they receive the same rows in a different order.
+  train_pool = train_pool.sort_values("site_id", kind="mergesort").copy()
+  print(
+      f"📊 Training pool: {len(train_pool):,} / {len(df):,} tiles meet the evidence threshold."
+  )
+
+  # --- SAFE BYPASS: TOO FEW TARGET ROWS ---
   if len(train_pool) < 10:
-    print(f"⚠️ Insufficient training data ({len(train_pool)} target tiles). Bypassing ML model.")
-    # Default predictions to actuals so residual becomes 0
-    df['cv_predicted_speed'] = df['download_kbps']
-    df['predicted_download_kbps'] = df['download_kbps']
-    df['top_shap_driver'] = 'Insufficient Data'
+    print(
+        f"⚠️ Insufficient training data ({len(train_pool)} target tiles). "
+        "Bypassing ML residual."
+    )
+    # No reliable model exists in this branch. Keep the residual neutral and
+    # expose the reason explicitly to downstream checks/UI.
+    df['cv_predicted_speed'] = df[target]
+    df['predicted_download_kbps'] = df[target]
+    df['top_shap_driver'] = 'Model bypassed'
     df['top_shap_value'] = 0.0
-    # This branch returns before the model exists to compute tree-variance
-    # uncertainty from — placeholder so downstream code never hits a
-    # missing-column error on a region too small to train on.
     df['prediction_uncertainty_kbps'] = np.nan
     df['prediction_uncertainty_pct'] = np.nan
+    df['model_validation_status'] = 'Bypassed - Insufficient Data'
+    df['model_residual_enabled'] = False
     return df
-  # --------------------------------------------------
-
 
   unique_blocks = np.array(sorted(train_pool['spatial_block'].unique()))
   num_blocks = len(unique_blocks)
-
   df['cv_predicted_speed'] = np.nan
 
-  # --- SCALE-ADAPTIVE GUARDRAIL ---
   if num_blocks < 2:
     print(
-        f"⚠️ Region too small for spatial CV (only {num_blocks} block found)."
-        " Bypassing CV step."
+        f"⚠️ Region too small for spatial CV (only {num_blocks} block found). "
+        "ML residual will be bypassed."
     )
+    df['model_validation_status'] = 'Bypassed - Insufficient Spatial Blocks'
+    df['model_residual_enabled'] = False
   else:
     actual_splits = min(n_splits, num_blocks)
     print(
-        f"🧩 Found {num_blocks} unique spatial blocks. Running"
-        f" {actual_splits}-fold CV..."
+        f"🧩 Found {num_blocks} unique spatial blocks. Running "
+        f"{actual_splits}-fold CV..."
     )
 
     kf = KFold(n_splits=actual_splits, shuffle=True, random_state=42)
@@ -95,74 +91,92 @@ def apply_spatial_blocking_cv(df, features, target, n_splits=5):
         continue
 
       model = RandomForestRegressor(
-          n_estimators=100, max_depth=6, min_samples_leaf=5, random_state=42
+          n_estimators=100,
+          max_depth=6,
+          min_samples_leaf=5,
+          random_state=42,
       )
-      
-
-      # Fit standard target directly
       model.fit(train_data[features], train_data[target])
-
-      # Predict standard scale
       preds = model.predict(val_data[features])
       df.loc[val_data.index, 'cv_predicted_speed'] = preds
 
-    clean_mask = df['cv_predicted_speed'].notna()
-    if clean_mask.sum() > 0:
+    clean_mask = target_mask & df['cv_predicted_speed'].notna()
+
+    if clean_mask.sum() > 1:
       global_r2 = r2_score(
-          df.loc[clean_mask, target], df.loc[clean_mask, 'cv_predicted_speed']
+          df.loc[clean_mask, target],
+          df.loc[clean_mask, 'cv_predicted_speed'],
       )
+      df['spatial_cv_r2'] = global_r2
+
       print(
           "📉 Spatially Blocked CV Complete. Out-of-Block R²:"
           f" {global_r2:.3f}"
       )
 
-      # Stratified R² — show whether the model generalizes evenly,
-      # or whether the pooled number is hiding stratum-specific weakness
+      if np.isfinite(global_r2) and global_r2 > 0.0:
+        df['model_validation_status'] = 'Validated'
+        df['model_residual_enabled'] = True
+      else:
+        print(
+            "⚠️ Model failed to generalize under spatial CV (R² <= 0 or non-finite). "
+            "Preserving the diagnostic predictions but disabling the ML residual "
+            "inside the priority score."
+        )
+        df['model_validation_status'] = 'Bypassed - Failed Spatial Validation'
+        df['model_residual_enabled'] = False
+
+      # Report stratum diagnostics regardless of pass/fail; these are
+      # diagnostics, not a claim that the model is valid within each stratum.
       print("\n📊 Out-of-Block R² by demographic stratum:")
-      for stratum in df.loc[clean_mask, 'demographic_stratum'].unique():
+      for stratum in df.loc[clean_mask, 'demographic_stratum'].dropna().unique():
         stratum_mask = clean_mask & (df['demographic_stratum'] == stratum)
         if stratum_mask.sum() > 1:
           stratum_r2 = r2_score(
-              df.loc[stratum_mask, target], df.loc[stratum_mask, 'cv_predicted_speed']
+              df.loc[stratum_mask, target],
+              df.loc[stratum_mask, 'cv_predicted_speed'],
           )
-          print(f"   {stratum}: R² = {stratum_r2:.3f}  (n={stratum_mask.sum()})")
+          print(
+              f"   {stratum}: R² = {stratum_r2:.3f}  "
+              f"(n={stratum_mask.sum()})"
+          )
+    else:
+      print("⚠️ No usable out-of-block predictions were produced. ML residual bypassed.")
+      df['model_validation_status'] = 'Bypassed - No CV Predictions'
+      df['model_residual_enabled'] = False
 
-  # Train ultimate model ONLY on reliable-evidence tiles, but predict for ALL rows
+  # Train the final model on the full reliable target pool. Even when the
+  # residual is bypassed, keeping this prediction is useful for diagnostics,
+  # SHAP inspection and future model development. It is not allowed to affect
+  # the ESG score when model_residual_enabled is False.
   print("🧠 Training final production model on evidence-threshold subset...")
   final_model = RandomForestRegressor(
-      n_estimators=100, max_depth=6, min_samples_leaf=5, random_state=42
+      n_estimators=100,
+      max_depth=6,
+      min_samples_leaf=5,
+      random_state=42,
   )
-  # Fit standard target directly
   final_model.fit(train_pool[features], train_pool[target])
-  
-  # Predict standard scale
   df['predicted_download_kbps'] = final_model.predict(df[features])
 
-  # Per-site model disagreement — the spread across the Random Forest's 100
-  # individual trees' predictions for the same input. This is NOT a
-  # calibrated confidence interval (no coverage guarantee has been validated
-  # — e.g. "the true value falls within this range X% of the time"); it is
-  # raw tree-to-tree disagreement. A site where all 100 trees roughly agree
-  # is one the model predicts stably; wide disagreement means treat that
-  # prediction (and the residual/priority score built from it) more
-  # cautiously. Confirmed on real data to carry a meaningful, non-degenerate
-  # range (~5%-40% relative disagreement). Describe as "model disagreement:
-  # variation across Random Forest trees" in the UI/pitch, not "confidence."
   print("📏 Computing per-site model disagreement (tree-to-tree variance)...")
   X_all = df[features].values
   tree_preds = np.stack([tree.predict(X_all) for tree in final_model.estimators_])
   df['prediction_uncertainty_kbps'] = tree_preds.std(axis=0)
   df['prediction_uncertainty_pct'] = (
-      df['prediction_uncertainty_kbps'] / df['predicted_download_kbps'].replace(0, np.nan)
+      df['prediction_uncertainty_kbps']
+      / df['predicted_download_kbps'].replace(0, np.nan)
   ).fillna(0.0)
 
-  # Rows outside the training pool never get a CV-validated prediction;
-  # fall back to the production model's prediction so residuals/scoring
-  # don't silently propagate NaN into the shortlist.
+  # Rows outside the target population do not have out-of-block predictions.
+  # Fill them for display continuity only. The ESG score is calculated only on
+  # approved underserved candidates, and model_residual_enabled governs whether
+  # the residual can contribute.
   missing_cv = df['cv_predicted_speed'].isna()
-  df.loc[missing_cv, 'cv_predicted_speed'] = df.loc[missing_cv, 'predicted_download_kbps']
+  df.loc[missing_cv, 'cv_predicted_speed'] = df.loc[
+      missing_cv, 'predicted_download_kbps'
+  ]
 
-  # ---- SHAP explainability ----
   print("🔍 Computing SHAP feature contributions...")
   explainer = shap.TreeExplainer(final_model)
   shap_values = explainer.shap_values(df[features], check_additivity=False)
@@ -203,13 +217,30 @@ def calculate_esg_priority_matrix(df, region=None):
   # diesel (it's a downstream impact question, now handled separately in
   # community_impact below), and road distance is a refuelling/logistics
   # cost, not evidence of grid status. Each input now has exactly one job.
-  power_remoteness = (df['distance_to_power_m'] / 5000.0).clip(lower=0.0, upper=1.0)
-  darkness_score = (1.0 - (df['night_radiance_nw_cm2_sr'] / 10.0)).clip(lower=0.0, upper=1.0)
+  power_remoteness = (
+      df['distance_to_power_m'] / 5000.0
+  ).clip(lower=0.0, upper=1.0)
+  darkness_score = (
+      1.0 - (df['night_radiance_nw_cm2_sr'] / 10.0)
+  ).clip(lower=0.0, upper=1.0)
 
-  df['off_grid_likelihood'] = (
-      0.75 * power_remoteness
-      + 0.25 * darkness_score
+  # Equal weighting when both evidence sources exist. If mapped power
+  # infrastructure is missing, the imputed 10 km value must NOT create
+  # artificial off-grid evidence; fall back to VIIRS darkness only.
+  power_missing = (
+      df['power_distance_missing'].fillna(False).astype(bool)
+      if 'power_distance_missing' in df.columns
+      else pd.Series(False, index=df.index)
   )
+
+  df['off_grid_likelihood'] = pd.Series(
+      np.where(
+          power_missing,
+          darkness_score,
+          0.50 * power_remoteness + 0.50 * darkness_score,
+      ),
+      index=df.index,
+  ).clip(lower=0.0, upper=1.0)
 
   # Solar Viability — aspect removed. Panels are mounted at whatever azimuth
   # is chosen; the direction the surrounding natural terrain happens to face
@@ -240,23 +271,25 @@ def calculate_esg_priority_matrix(df, region=None):
       + (df['terrain_ruggedness'] / 50.0) * 0.2  # Penalize highly rugged terrain
   ).clip(lower=0.1)
 
-  # CO2 Threshold Gate
-  # GSMA Decarbonization Benchmarks (13,000 L/yr = 34.2 tCO2e/yr baseline).
-  # We multiply by likelihood here so the dashboard displays the EXPECTED actual savings
-  expected_abatement = 34.2 * 0.65 * df['off_grid_likelihood'].clip(upper=1.0)
+  # Indicative impact estimates use the ABSOLUTE off-grid proxy continuously.
+  # The priority score below uses percentile ranks because it is a relative
+  # prioritisation tool; abatement/OPEX are different: they should retain the
+  # magnitude of the underlying proxy. The old hard cutoff at 0.10 could create
+  # an awkward edge case where a relatively high-ranked diesel candidate showed
+  # exactly zero indicative savings. Continuous scaling removes that discontinuity.
+  #
+  # Published planning benchmarks:
+  #   diesel baseline = 34.2 tCO2e/yr
+  #   hybrid displacement = 65%
+  #   off-grid OPEX benchmark = US$17,000/yr
+  off_grid_abs = df['off_grid_likelihood'].clip(lower=0.0, upper=1.0)
 
-  df['indicative_abatement_tco2e_yr'] = np.where(
-      df['off_grid_likelihood'] < 0.10,
-      0.0,
-      expected_abatement
+  df['indicative_abatement_tco2e_yr'] = (
+      34.2 * 0.65 * off_grid_abs
   )
 
-  # OPEX Savings for the Dashboard Lead (US$17,000/yr off-grid baseline)
-  opex_credit = 17000 * df['off_grid_likelihood'].clip(upper=1.0)
-  df['indicative_opex_saving_usd'] = np.where(
-      df['off_grid_likelihood'] < 0.10,
-      0.0,
-      opex_credit
+  df['indicative_opex_saving_usd'] = (
+      17000.0 * off_grid_abs
   )
 
   # TNB Grid-Connected Comparison (workplan Step 3)
@@ -284,10 +317,8 @@ def calculate_esg_priority_matrix(df, region=None):
         diesel_energy_equivalent_kwh * TNB_GRID_EMISSION_FACTOR_KG_PER_KWH
     ) / 1000.0
 
-    df['grid_equivalent_tco2e_yr'] = np.where(
-        df['off_grid_likelihood'] < 0.10,
-        0.0,
-        grid_equivalent_tco2e_yr_full * df['off_grid_likelihood'].clip(upper=1.0)
+    df['grid_equivalent_tco2e_yr'] = (
+        grid_equivalent_tco2e_yr_full * off_grid_abs
     )
   else:
     df['grid_equivalent_tco2e_yr'] = np.nan
@@ -298,9 +329,20 @@ def calculate_esg_priority_matrix(df, region=None):
   # clipped at 0.0, not 1.0 — the old floor of 1.0 meant overperforming sites
   # (negative raw residual) got folded in alongside genuinely marginal ones,
   # and both ended up tied at the same nonzero value.
-  df['underperformance_residual'] = (
+  raw_residual = (
       df['cv_predicted_speed'] - df['download_kbps']
   ).clip(lower=0.0)
+
+  # The model may still emit diagnostic predictions after a failed spatial CV,
+  # but those predictions must not influence the priority score.
+  residual_enabled = (
+      df['model_residual_enabled'].fillna(False).astype(bool)
+      if 'model_residual_enabled' in df.columns
+      else pd.Series(True, index=df.index)
+  )
+  df['underperformance_residual'] = raw_residual.where(
+      residual_enabled, 0.0
+  )
 
   # Essential Service Weight — continuous proximity score, not a binary cutoff.
   # The old version (50.0 if within 2.5km, else 0.0) collapsed almost every
@@ -548,10 +590,17 @@ def run_pipeline(input_file=None, data_dir="data", region="malaysia"):
       rank_mask = df['field_survey_triggered']
       df.loc[rank_mask, 'national_rank'] = np.arange(1, rank_mask.sum() + 1)
       
-  # 5. Export Output for Dashboard Lead (Teammate #3)
-  output_path = os.path.join(data_dir, "jendela_phase2_esg_scored.parquet")
+  # 5. Export to staging first. Production app.py intentionally ignores
+  # data/NEW so a scoring change cannot silently replace the approved demo file.
+  region_slug = region.lower().replace(" ", "_")
+  staging_dir = os.path.join(data_dir, "NEW")
+  os.makedirs(staging_dir, exist_ok=True)
+  output_path = os.path.join(
+      staging_dir,
+      f"jendela_phase2_esg_matrix_{region_slug}.parquet",
+  )
   df.to_parquet(output_path, index=False)
-  print(f"✅ Successfully exported scored priority matrix to '{output_path}'!")
+  print(f"✅ Successfully exported staged priority matrix to '{output_path}'!")
 
  # Quick Top-5 Summary
   if not valid_mask.any():
